@@ -246,6 +246,7 @@ import { environmentRuntimeService } from "./environment-runtime.js";
 import { skillVersionSelectionMap } from "./runtime-skill-selections.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
 import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
+import { buildAuthenticatedUrl } from "./git-auth.js";
 import {
   clearHeartbeatRunRuntimeStatus,
   getHeartbeatRunRuntimeStatus,
@@ -1311,6 +1312,7 @@ async function ensureManagedProjectWorkspace(input: {
   companyId: string;
   projectId: string;
   repoUrl: string | null;
+  resolvedEnv?: Record<string, string>;
 }): Promise<{ cwd: string; warning: string | null }> {
   const cwd = resolveManagedProjectWorkspaceDir({
     companyId: input.companyId,
@@ -1347,8 +1349,16 @@ async function ensureManagedProjectWorkspace(input: {
   }
 
   try {
-    await execFile("git", ["clone", input.repoUrl, cwd], {
-      env: sanitizeRuntimeServiceBaseEnv(process.env),
+    const resolvedEnv = input.resolvedEnv ?? {};
+    const cloneEnv = {
+      ...sanitizeRuntimeServiceBaseEnv(process.env),
+      ...resolvedEnv,
+    };
+
+    const authUrl = buildAuthenticatedUrl(input.repoUrl, resolvedEnv);
+
+    await execFile("git", ["clone", authUrl, cwd], {
+      env: cloneEnv,
       timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS,
     });
     return { cwd, warning: null };
@@ -7200,7 +7210,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     context: Record<string, unknown>,
     previousSessionParams: Record<string, unknown> | null,
-    opts?: { useProjectWorkspace?: boolean | null },
+    opts?: { useProjectWorkspace?: boolean | null; resolvedEnv?: Record<string, string> },
   ): Promise<ResolvedWorkspaceForRun> {
     const issueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
     const contextProjectId = readNonEmptyString(context.projectId);
@@ -7266,6 +7276,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               companyId: agent.companyId,
               projectId: workspaceProjectId ?? resolvedProjectId ?? workspace.projectId,
               repoUrl: readNonEmptyString(workspace.repoUrl),
+              resolvedEnv: opts?.resolvedEnv,
             });
             projectCwd = managedWorkspace.cwd;
             managedWorkspaceWarning = managedWorkspace.warning;
@@ -7338,6 +7349,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         companyId: agent.companyId,
         projectId: workspaceProjectId,
         repoUrl: null,
+        resolvedEnv: opts?.resolvedEnv,
       });
       return {
         cwd: managedWorkspace.cwd,
@@ -12343,7 +12355,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agent,
           context,
           previousSessionParams,
-          { useProjectWorkspace: requestedExecutionWorkspaceMode !== "agent_default" },
+          {
+            useProjectWorkspace: requestedExecutionWorkspaceMode !== "agent_default",
+            resolvedEnv: Object.fromEntries(
+              Object.entries(parseObject(resolvedConfig.env)).filter(
+                (entry): entry is [string, string] => typeof entry[0] === "string" && typeof entry[1] === "string",
+              ),
+            ),
+          },
         ),
     });
     const hostExecutionWorkspaceConfig = stripHostWorkspaceProvisionForLowTrustSandbox({
