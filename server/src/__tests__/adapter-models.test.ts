@@ -5,7 +5,7 @@ import { models as codexFallbackModels } from "@paperclipai/adapter-codex-local"
 import { models as cursorFallbackModels } from "@paperclipai/adapter-cursor-local";
 import { models as opencodeFallbackModels } from "@paperclipai/adapter-opencode-local";
 import { resetOpenCodeModelsCacheForTests } from "@paperclipai/adapter-opencode-local/server";
-import { listAdapterModels, listServerAdapters, refreshAdapterModels } from "../adapters/index.js";
+import { listAdapterModels, listServerAdapters, refreshAdapterModels, resetOpenRouterModelsCacheForTests } from "../adapters/index.js";
 import { resetCodexModelsCacheForTests } from "../adapters/codex-models.js";
 import { resetCursorModelsCacheForTests, setCursorModelsRunnerForTests } from "../adapters/cursor-models.js";
 
@@ -24,11 +24,15 @@ describe("adapter model listing", () => {
     delete process.env.ANTHROPIC_BEDROCK_BASE_URL;
     delete process.env.CLAUDE_CODE_USE_BEDROCK;
     delete process.env.PAPERCLIP_OPENCODE_COMMAND;
+    delete process.env.PAPERCLIP_ADAPTER_MODELS;
+    delete process.env.OPENROUTER_BASE_URL;
+    delete process.env.OPENROUTER_API_KEY;
     resetClaudeModelsCacheForTests();
     resetCodexModelsCacheForTests();
     resetCursorModelsCacheForTests();
     setCursorModelsRunnerForTests(null);
     resetOpenCodeModelsCacheForTests();
+    resetOpenRouterModelsCacheForTests();
     vi.restoreAllMocks();
   });
 
@@ -317,6 +321,201 @@ describe("adapter model listing", () => {
       });
       const models = await listAdapterModels("codex_local");
       expect(models).toEqual(codexFallbackModels);
+    });
+  });
+
+  describe("OPENROUTER_BASE_URL dynamic model discovery", () => {
+    it("returns models from the OpenRouter-compatible endpoint", async () => {
+      process.env.OPENROUTER_BASE_URL = "http://omniroute:20129/v1";
+      process.env.OPENROUTER_API_KEY = "sk-test";
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: [
+            { id: "oc/claude-sonnet-4", name: "Claude Sonnet 4", type: "chat" },
+            { id: "auto/gpt-4o", name: "GPT-4o Auto", type: "chat" },
+          ],
+        }),
+      } as Response);
+
+      const models = await listAdapterModels("opencode_local");
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy.mock.calls[0][0]).toBe("http://omniroute:20129/v1/models");
+      expect(models).toEqual([
+        { id: "omniroute/oc/claude-sonnet-4", label: "Claude Sonnet 4" },
+        { id: "omniroute/auto/gpt-4o", label: "GPT-4o Auto" },
+      ]);
+    });
+
+    it("caches results and does not re-fetch within TTL", async () => {
+      process.env.OPENROUTER_BASE_URL = "http://omniroute:20129/v1";
+      process.env.OPENROUTER_API_KEY = "sk-test";
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: [{ id: "oc/model-a", name: "Model A" }],
+        }),
+      } as Response);
+
+      const first = await listAdapterModels("opencode_local");
+      const second = await listAdapterModels("opencode_local");
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(first).toEqual(second);
+    });
+
+    it("filters out video models", async () => {
+      process.env.OPENROUTER_BASE_URL = "http://omniroute:20129/v1";
+      vi.spyOn(globalThis, "fetch").mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: [
+            { id: "oc/claude-sonnet-4", name: "Claude Sonnet 4", type: "chat" },
+            { id: "video/sora", name: "Sora", type: "video" },
+          ],
+        }),
+      } as Response);
+
+      const models = await listAdapterModels("opencode_local");
+
+      expect(models).toEqual([
+        { id: "omniroute/oc/claude-sonnet-4", label: "Claude Sonnet 4" },
+      ]);
+    });
+
+    it("uses id as label when name is missing", async () => {
+      process.env.OPENROUTER_BASE_URL = "http://omniroute:20129/v1";
+      vi.spyOn(globalThis, "fetch").mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: [{ id: "oc/no-name-model" }],
+        }),
+      } as Response);
+
+      const models = await listAdapterModels("opencode_local");
+
+      expect(models).toEqual([{ id: "omniroute/oc/no-name-model", label: "oc/no-name-model" }]);
+    });
+
+    it("returns empty array when fetch fails (soft-fail)", async () => {
+      process.env.OPENROUTER_BASE_URL = "http://omniroute:20129/v1";
+      process.env.PAPERCLIP_OPENCODE_COMMAND = "__paperclip_missing_opencode_command__";
+      vi.spyOn(globalThis, "fetch").mockResolvedValue({
+        ok: false,
+        status: 500,
+        json: async () => ({}),
+      } as Response);
+
+      const models = await listAdapterModels("opencode_local");
+
+      expect(models).toEqual(opencodeFallbackModels);
+    });
+
+    it("returns empty array when fetch throws (soft-fail)", async () => {
+      process.env.OPENROUTER_BASE_URL = "http://omniroute:20129/v1";
+      process.env.PAPERCLIP_OPENCODE_COMMAND = "__paperclip_missing_opencode_command__";
+      vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network error"));
+
+      const models = await listAdapterModels("opencode_local");
+
+      expect(models).toEqual(opencodeFallbackModels);
+    });
+
+    it("sends Authorization header when OPENROUTER_API_KEY is set", async () => {
+      process.env.OPENROUTER_BASE_URL = "http://omniroute:20129/v1";
+      process.env.OPENROUTER_API_KEY = "sk-a27d81d51a749aa1-0ee363-44d44146";
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [{ id: "m/gpt-4o" }] }),
+      } as Response);
+
+      await listAdapterModels("opencode_local");
+
+      const headers = (fetchSpy.mock.calls[0][1] as RequestInit)?.headers as Record<string, string>;
+      expect(headers.Authorization).toBe("Bearer sk-a27d81d51a749aa1-0ee363-44d44146");
+    });
+
+    it("skips Authorization header when OPENROUTER_API_KEY is empty", async () => {
+      process.env.OPENROUTER_BASE_URL = "http://omniroute:20129/v1";
+      process.env.OPENROUTER_API_KEY = "";
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [{ id: "m/gpt-4o" }] }),
+      } as Response);
+
+      await listAdapterModels("opencode_local");
+
+      const headers = (fetchSpy.mock.calls[0][1] as RequestInit)?.headers as Record<string, string>;
+      expect(headers.Authorization).toBeUndefined();
+    });
+
+    it("does not fetch when OPENROUTER_BASE_URL is unset", async () => {
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+      process.env.PAPERCLIP_OPENCODE_COMMAND = "__paperclip_missing_opencode_command__";
+      const models = await listAdapterModels("opencode_local");
+
+      expect(models).toEqual(opencodeFallbackModels);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it("PAPERCLIP_ADAPTER_MODELS takes priority over OPENROUTER_BASE_URL", async () => {
+      process.env.PAPERCLIP_ADAPTER_MODELS = JSON.stringify({
+        opencode_local: [{ id: "env/model-a", label: "Env Model A" }],
+      });
+      process.env.OPENROUTER_BASE_URL = "http://omniroute:20129/v1";
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+      const models = await listAdapterModels("opencode_local");
+
+      expect(models).toEqual([{ id: "env/model-a", label: "Env Model A" }]);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it("refreshAdapterModels clears OpenRouter cache and re-fetches", async () => {
+      process.env.OPENROUTER_BASE_URL = "http://omniroute:20129/v1";
+      process.env.OPENROUTER_API_KEY = "sk-test";
+      const fetchSpy = vi.spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            data: [{ id: "oc/model-v1", name: "Model V1" }],
+          }),
+        } as Response)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            data: [{ id: "oc/model-v2", name: "Model V2" }],
+          }),
+        } as Response);
+
+      const initial = await listAdapterModels("opencode_local");
+      const refreshed = await refreshAdapterModels("opencode_local");
+
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      expect(initial.some((m) => m.id === "omniroute/oc/model-v1")).toBe(true);
+      expect(refreshed.some((m) => m.id === "omniroute/oc/model-v2")).toBe(true);
+    });
+
+    it("works for pi_local adapter (not just opencode)", async () => {
+      process.env.OPENROUTER_BASE_URL = "http://omniroute:20129/v1";
+      vi.spyOn(globalThis, "fetch").mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: [
+            { id: "oc/claude-sonnet-4", name: "Claude Sonnet 4" },
+            { id: "auto/gpt-4o", name: "GPT-4o Auto" },
+          ],
+        }),
+      } as Response);
+
+      const models = await listAdapterModels("pi_local");
+
+      expect(models).toEqual([
+        { id: "omniroute/oc/claude-sonnet-4", label: "Claude Sonnet 4" },
+        { id: "omniroute/auto/gpt-4o", label: "GPT-4o Auto" },
+      ]);
     });
   });
 });
