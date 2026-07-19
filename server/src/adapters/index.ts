@@ -10,6 +10,7 @@ export {
   registerServerAdapter,
   unregisterServerAdapter,
   requireServerAdapter,
+  resetOpenRouterModelsCacheForTests,
 } from "./registry.js";
 export type {
   ServerAdapterModule,
