@@ -222,6 +222,13 @@ async function startServerWithDatabaseTeardown(
   // sentry.ts.
   await sentryReady;
   ensureDecisionSigningSecret();
+  // Dynamic import AFTER OTel has patched http.Server.prototype so that the
+  // application resolves the same http module identity that OTel instrumented.
+  // See https://github.com/paperclipai/paperclip/issues/8437
+  const { createServer } = await import("node:http");
+  logger.info(
+    "http.createServer loaded after OTel instrumentation ready — spans should be emitted",
+  );
   let config = loadConfig();
   initTelemetry({ enabled: config.telemetryEnabled });
   if (process.env.PAPERCLIP_SECRETS_PROVIDER === undefined) {
