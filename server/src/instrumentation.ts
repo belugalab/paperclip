@@ -174,6 +174,12 @@ async function bootstrapOtel(endpoint: string): Promise<void> {
       return;
     }
 
+    // eslint-disable-next-line no-console
+    console.info(
+      `[paperclip] OpenTelemetry tracing active (protocol=${protocol}, service=${process.env.OTEL_SERVICE_NAME || "paperclip"}). ` +
+        `Any http.createServer() call made AFTER this log line will emit spans.`,
+    );
+
     sdkShutdown = () =>
       Promise.race([
         sdk.shutdown(),
