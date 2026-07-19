@@ -100,6 +100,26 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && mkdir -p /paperclip \
   && chown node:node /paperclip
 
+# Install OTel packages into server/node_modules/ so the server's dynamic
+# import() resolves them through standard Node module resolution. Global
+# npm install is unreliable for ESM dynamic imports. See #8437.
+RUN mkdir -p /tmp/otel && cd /tmp/otel && npm init -y > /dev/null 2>&1 \
+  && npm install \
+    @opentelemetry/sdk-node \
+    @opentelemetry/auto-instrumentations-node \
+    @opentelemetry/resources \
+    @opentelemetry/semantic-conventions \
+    @opentelemetry/exporter-trace-otlp-grpc \
+  && mkdir -p /app/server/node_modules \
+  && cp -r node_modules/@opentelemetry /app/server/node_modules/ \
+  && for pkg in node_modules/*; do \
+       name=$(basename "$pkg"); \
+       [ "$name" = "@opentelemetry" ] && continue; \
+       [ ! -e "/app/server/node_modules/$name" ] && cp -r "$pkg" "/app/server/node_modules/$name"; \
+     done \
+  && chown -R node:node /app/server/node_modules/@opentelemetry \
+  && rm -rf /tmp/otel
+
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
