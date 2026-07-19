@@ -15,7 +15,7 @@ import { reconcileAbandonedExecutionControl } from "./services/execution-control
 import { EXECUTION_RECONCILIATION_INTERVAL_MS } from "./services/execution-control-deadline.js";
 import { connectionIntentDeliveryService } from "./services/connection-intent-delivery.js";
 import { existsSync, readFileSync, rmSync } from "node:fs";
-import { createServer } from "node:http";
+import type { Server } from "node:http";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
@@ -161,7 +161,7 @@ type EmbeddedPostgresCtor = new (opts: {
 
 
 export interface StartedServer {
-  server: ReturnType<typeof createServer>;
+  server: Server;
   host: string;
   listenPort: number;
   apiUrl: string;
@@ -213,6 +213,13 @@ async function startServerWithDatabaseTeardown(
   // sentry.ts.
   await sentryReady;
   ensureDecisionSigningSecret();
+  // Dynamic import AFTER OTel has patched http.Server.prototype so that the
+  // application resolves the same http module identity that OTel instrumented.
+  // See https://github.com/paperclipai/paperclip/issues/8437
+  const { createServer } = await import("node:http");
+  logger.info(
+    "http.createServer loaded after OTel instrumentation ready — spans should be emitted",
+  );
   let config = loadConfig();
   initTelemetry({ enabled: config.telemetryEnabled });
   if (process.env.PAPERCLIP_SECRETS_PROVIDER === undefined) {
