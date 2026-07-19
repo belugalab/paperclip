@@ -1,8 +1,8 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { prepareOpenCodeRuntimeConfig, resetOmniRouteProviderCacheForTests } from "./runtime-config.js";
 
 const cleanupPaths = new Set<string>();
 
@@ -319,5 +319,164 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     expect(prepared.env).toEqual({ XDG_CONFIG_HOME: configHome });
     expect(prepared.notes).toEqual([]);
     await prepared.cleanup();
+  });
+
+  describe("OmniRoute auto-generated provider", () => {
+    const originalFetch = globalThis.fetch;
+
+    afterEach(() => {
+      globalThis.fetch = originalFetch;
+      resetOmniRouteProviderCacheForTests();
+      delete process.env.OPENROUTER_BASE_URL;
+      delete process.env.OPENROUTER_API_KEY;
+    });
+
+    it("auto-generates the OmniRoute provider when OPENROUTER_BASE_URL is set and PAPERCLIP_OPENCODE_PROVIDERS is absent", async () => {
+      const configHome = await makeConfigHome({ permission: { read: "allow" } });
+      const mockModels = {
+        data: [
+          { id: "auto/fast", name: "Auto Fast", type: "chat" },
+          { id: "auto/chat", name: "Auto Chat", type: "chat" },
+        ],
+      };
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve(mockModels),
+      }) as unknown as typeof fetch;
+
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: {
+          XDG_CONFIG_HOME: configHome,
+          OPENROUTER_BASE_URL: "http://omniroute:20129/v1",
+          OPENROUTER_API_KEY: "sk-test-key",
+        },
+        config: {},
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+      const runtimeConfig = JSON.parse(
+        await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+      ) as { provider?: { omniroute?: Record<string, unknown> } };
+      expect(runtimeConfig.provider?.omniroute).toBeDefined();
+      const omniProvider = runtimeConfig.provider!.omniroute!;
+      expect(omniProvider.npm).toBe("@ai-sdk/openai-compatible");
+      expect(omniProvider.name).toBe("OmniRoute");
+      expect(omniProvider.options).toEqual({
+        baseURL: "http://omniroute:20129/v1",
+        apiKey: "sk-test-key",
+      });
+      expect(omniProvider.models).toEqual({
+        "auto/fast": { name: "Auto Fast" },
+        "auto/chat": { name: "Auto Chat" },
+      });
+      expect(prepared.notes.some((n) => n.includes("Auto-generated OmniRoute provider"))).toBe(true);
+      await prepared.cleanup();
+    });
+
+    it("PAPERCLIP_OPENCODE_PROVIDERS takes precedence over OPENROUTER_BASE_URL", async () => {
+      const configHome = await makeConfigHome({ permission: { read: "allow" } });
+      const staticProviders = {
+        custom: { npm: "@ai-sdk/openai-compatible", models: { "x/y": {} } },
+      };
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ data: [{ id: "auto/fast" }] }),
+      }) as unknown as typeof fetch;
+
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: {
+          XDG_CONFIG_HOME: configHome,
+          PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify(staticProviders),
+          OPENROUTER_BASE_URL: "http://omniroute:20129/v1",
+          OPENROUTER_API_KEY: "sk-test-key",
+        },
+        config: {},
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+      const runtimeConfig = JSON.parse(
+        await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+      ) as { provider?: Record<string, unknown> };
+      expect(runtimeConfig.provider).toEqual(staticProviders);
+      expect(runtimeConfig.provider?.omniroute).toBeUndefined();
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+      await prepared.cleanup();
+    });
+
+    it("soft-fails when the fetch returns non-ok", async () => {
+      const configHome = await makeConfigHome({ permission: { read: "allow" } });
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 500,
+      }) as unknown as typeof fetch;
+
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: {
+          XDG_CONFIG_HOME: configHome,
+          OPENROUTER_BASE_URL: "http://omniroute:20129/v1",
+          OPENROUTER_API_KEY: "sk-test-key",
+        },
+        config: {},
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+      const runtimeConfig = JSON.parse(
+        await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+      ) as Record<string, unknown>;
+      expect(runtimeConfig.provider).toBeUndefined();
+      expect(prepared.notes.some((n) => n.includes("Auto-generated OmniRoute"))).toBe(false);
+      await prepared.cleanup();
+    });
+
+    it("soft-fails when fetch throws", async () => {
+      const configHome = await makeConfigHome({ permission: { read: "allow" } });
+      globalThis.fetch = vi.fn().mockRejectedValue(new Error("network error"));
+
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: {
+          XDG_CONFIG_HOME: configHome,
+          OPENROUTER_BASE_URL: "http://omniroute:20129/v1",
+          OPENROUTER_API_KEY: "sk-test-key",
+        },
+        config: {},
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+      const runtimeConfig = JSON.parse(
+        await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+      ) as Record<string, unknown>;
+      expect(runtimeConfig.provider).toBeUndefined();
+      await prepared.cleanup();
+    });
+
+    it("skips video models in the auto-generated provider", async () => {
+      const configHome = await makeConfigHome({ permission: { read: "allow" } });
+      const mockModels = {
+        data: [
+          { id: "auto/fast", name: "Auto Fast", type: "chat" },
+          { id: "some-video-model", name: "Video Model", type: "video" },
+        ],
+      };
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve(mockModels),
+      }) as unknown as typeof fetch;
+
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: {
+          XDG_CONFIG_HOME: configHome,
+          OPENROUTER_BASE_URL: "http://omniroute:20129/v1",
+          OPENROUTER_API_KEY: "sk-test-key",
+        },
+        config: {},
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+      const runtimeConfig = JSON.parse(
+        await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+      ) as { provider?: { omniroute?: { models?: Record<string, unknown> } } };
+      expect(Object.keys(runtimeConfig.provider?.omniroute?.models ?? {})).toEqual(["auto/fast"]);
+      await prepared.cleanup();
+    });
   });
 });
