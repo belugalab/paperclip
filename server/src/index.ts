@@ -315,6 +315,13 @@ async function startServerWithDatabaseTeardown(
   // Error monitoring must be ready before the first request can fail — see
   // sentry.ts.
   await sentryReady;
+  // Dynamic import AFTER OTel has patched http.Server.prototype so that the
+  // application resolves the same http module identity that OTel instrumented.
+  // See https://github.com/paperclipai/paperclip/issues/8437
+  const { createServer } = await import("node:http");
+  logger.info(
+    "http.createServer loaded after OTel instrumentation ready — spans should be emitted",
+  );
   const startupConfig = isCloudManagedInstance() ? loadCloudBootstrapConfig() : loadConfig();
   if ("deploymentMode" in startupConfig) {
     assertEphemeralServerConfig(startupConfig);
