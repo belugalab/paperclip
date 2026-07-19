@@ -577,6 +577,68 @@ export function getServerAdapter(type: string): ServerAdapterModule {
   return findActiveServerAdapter(type) ?? processAdapter;
 }
 
+// ---------------------------------------------------------------------------
+// OPENROUTER_BASE_URL dynamic model discovery
+// ---------------------------------------------------------------------------
+
+const OPENROUTER_MODELS_CACHE_TTL_MS = 60_000;
+const openrouterModelsCache = new Map<
+  string,
+  { expiresAt: number; models: { id: string; label: string }[] }
+>();
+
+/**
+ * When `OPENROUTER_BASE_URL` is set, fetch the live model catalog from that
+ * endpoint (standard OpenAI-compatible `GET /models`).  This lets any adapter
+ * (opencode, pi, hermes, …) surface gateway-served models in the agent
+ * model-picker without per-adapter code changes.
+ *
+ * Returns `[]` when the env var is unset or the fetch fails (soft-fail).
+ */
+async function fetchOpenRouterModelsFromEnv(): Promise<
+  { id: string; label: string }[]
+> {
+  const baseUrl = process.env.OPENROUTER_BASE_URL?.trim();
+  if (!baseUrl) return [];
+
+  const apiKey = process.env.OPENROUTER_API_KEY?.trim() ?? "";
+  const cacheKey = `${baseUrl}::${apiKey}`;
+  const now = Date.now();
+  const cached = openrouterModelsCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) return cached.models;
+
+  try {
+    const res = await fetch(`${baseUrl}/models`, {
+      headers: {
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        "Content-Type": "application/json",
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return [];
+
+    const data = (await res.json()) as {
+      data: Array<{ id: string; name?: string; type?: string }>;
+    };
+
+    const models = (data.data ?? [])
+      .filter((m) => m.type !== "video")
+      .map((m) => ({ id: `omniroute/${m.id}`, label: m.name || m.id }));
+
+    openrouterModelsCache.set(cacheKey, {
+      expiresAt: now + OPENROUTER_MODELS_CACHE_TTL_MS,
+      models,
+    });
+    return models;
+  } catch {
+    return [];
+  }
+}
+
+export function resetOpenRouterModelsCacheForTests() {
+  openrouterModelsCache.clear();
+}
+
 /**
  * Memoized view of PAPERCLIP_ADAPTER_MODELS, keyed by the raw env string so
  * tests (and live env mutation) that change the variable are still observed.
@@ -613,6 +675,8 @@ export async function listAdapterModels(type: string): Promise<{ id: string; lab
   if (declaredModels && declaredModels[type]?.length) {
     return declaredModels[type].map((m) => ({ id: m.id, label: m.label ?? m.id }));
   }
+  const openrouterModels = await fetchOpenRouterModelsFromEnv();
+  if (openrouterModels.length > 0) return openrouterModels;
   const adapter = findActiveServerAdapter(type);
   if (!adapter) return [];
   if (adapter.listModels) {
@@ -623,12 +687,15 @@ export async function listAdapterModels(type: string): Promise<{ id: string; lab
 }
 
 export async function refreshAdapterModels(type: string): Promise<{ id: string; label: string }[]> {
+  openrouterModelsCache.clear();
   const adapter = findActiveServerAdapter(type);
   if (!adapter) return [];
   if (adapter.refreshModels) {
     const refreshed = await adapter.refreshModels();
     if (refreshed.length > 0) return refreshed;
   }
+  const openrouterModels = await fetchOpenRouterModelsFromEnv();
+  if (openrouterModels.length > 0) return openrouterModels;
   if (adapter.listModels) {
     const discovered = await adapter.listModels();
     if (discovered.length > 0) return discovered;
