@@ -289,9 +289,10 @@ describe("adapter model listing", () => {
   });
 
   describe("OPENROUTER_BASE_URL dynamic model discovery", () => {
-    it("returns models from the OpenRouter-compatible endpoint", async () => {
+    it("merges native opencode models with OpenRouter models", async () => {
       process.env.OPENROUTER_BASE_URL = "http://omniroute:20129/v1";
       process.env.OPENROUTER_API_KEY = "sk-test";
+      process.env.PAPERCLIP_OPENCODE_COMMAND = "__paperclip_missing_opencode_command__";
       const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
         ok: true,
         json: async () => ({
@@ -306,15 +307,16 @@ describe("adapter model listing", () => {
 
       expect(fetchSpy).toHaveBeenCalledTimes(1);
       expect(fetchSpy.mock.calls[0][0]).toBe("http://omniroute:20129/v1/models");
-      expect(models).toEqual([
-        { id: "omniroute/oc/claude-sonnet-4", label: "Claude Sonnet 4" },
-        { id: "omniroute/auto/gpt-4o", label: "GPT-4o Auto" },
-      ]);
+      // Native opencode models come first, then OpenRouter models.
+      expect(models[0]).toEqual(opencodeFallbackModels[0]);
+      expect(models.some((m) => m.id === "omniroute/oc/claude-sonnet-4")).toBe(true);
+      expect(models.some((m) => m.id === "omniroute/auto/gpt-4o")).toBe(true);
     });
 
     it("caches results and does not re-fetch within TTL", async () => {
       process.env.OPENROUTER_BASE_URL = "http://omniroute:20129/v1";
       process.env.OPENROUTER_API_KEY = "sk-test";
+      process.env.PAPERCLIP_OPENCODE_COMMAND = "__paperclip_missing_opencode_command__";
       const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
         ok: true,
         json: async () => ({
@@ -327,10 +329,13 @@ describe("adapter model listing", () => {
 
       expect(fetchSpy).toHaveBeenCalledTimes(1);
       expect(first).toEqual(second);
+      // Native models are included.
+      expect(first.some((m) => m.id === opencodeFallbackModels[0].id)).toBe(true);
     });
 
     it("filters out video models", async () => {
       process.env.OPENROUTER_BASE_URL = "http://omniroute:20129/v1";
+      process.env.PAPERCLIP_OPENCODE_COMMAND = "__paperclip_missing_opencode_command__";
       vi.spyOn(globalThis, "fetch").mockResolvedValue({
         ok: true,
         json: async () => ({
@@ -343,13 +348,16 @@ describe("adapter model listing", () => {
 
       const models = await listAdapterModels("opencode_local");
 
-      expect(models).toEqual([
-        { id: "omniroute/oc/claude-sonnet-4", label: "Claude Sonnet 4" },
-      ]);
+      // Native models + non-video OpenRouter models.
+      expect(models.some((m) => m.id === "omniroute/oc/claude-sonnet-4")).toBe(true);
+      expect(models.some((m) => m.id.includes("sora"))).toBe(false);
+      // Native models are still present.
+      expect(models.some((m) => m.id === opencodeFallbackModels[0].id)).toBe(true);
     });
 
     it("uses id as label when name is missing", async () => {
       process.env.OPENROUTER_BASE_URL = "http://omniroute:20129/v1";
+      process.env.PAPERCLIP_OPENCODE_COMMAND = "__paperclip_missing_opencode_command__";
       vi.spyOn(globalThis, "fetch").mockResolvedValue({
         ok: true,
         json: async () => ({
@@ -359,10 +367,10 @@ describe("adapter model listing", () => {
 
       const models = await listAdapterModels("opencode_local");
 
-      expect(models).toEqual([{ id: "omniroute/oc/no-name-model", label: "oc/no-name-model" }]);
+      expect(models.some((m) => m.id === "omniroute/oc/no-name-model" && m.label === "oc/no-name-model")).toBe(true);
     });
 
-    it("returns empty array when fetch fails (soft-fail)", async () => {
+    it("falls back to native models when OpenRouter fetch fails", async () => {
       process.env.OPENROUTER_BASE_URL = "http://omniroute:20129/v1";
       process.env.PAPERCLIP_OPENCODE_COMMAND = "__paperclip_missing_opencode_command__";
       vi.spyOn(globalThis, "fetch").mockResolvedValue({
@@ -373,16 +381,18 @@ describe("adapter model listing", () => {
 
       const models = await listAdapterModels("opencode_local");
 
+      // Native opencode models are returned even when OpenRouter fetch fails.
       expect(models).toEqual(opencodeFallbackModels);
     });
 
-    it("returns empty array when fetch throws (soft-fail)", async () => {
+    it("falls back to native models when OpenRouter fetch throws", async () => {
       process.env.OPENROUTER_BASE_URL = "http://omniroute:20129/v1";
       process.env.PAPERCLIP_OPENCODE_COMMAND = "__paperclip_missing_opencode_command__";
       vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network error"));
 
       const models = await listAdapterModels("opencode_local");
 
+      // Native opencode models are returned even when OpenRouter fetch throws.
       expect(models).toEqual(opencodeFallbackModels);
     });
 
@@ -414,10 +424,10 @@ describe("adapter model listing", () => {
       expect(headers.Authorization).toBeUndefined();
     });
 
-    it("does not fetch when OPENROUTER_BASE_URL is unset", async () => {
+    it("returns only native models when OPENROUTER_BASE_URL is unset", async () => {
       const fetchSpy = vi.spyOn(globalThis, "fetch");
-
       process.env.PAPERCLIP_OPENCODE_COMMAND = "__paperclip_missing_opencode_command__";
+
       const models = await listAdapterModels("opencode_local");
 
       expect(models).toEqual(opencodeFallbackModels);
@@ -440,6 +450,7 @@ describe("adapter model listing", () => {
     it("refreshAdapterModels clears OpenRouter cache and re-fetches", async () => {
       process.env.OPENROUTER_BASE_URL = "http://omniroute:20129/v1";
       process.env.OPENROUTER_API_KEY = "sk-test";
+      process.env.PAPERCLIP_OPENCODE_COMMAND = "__paperclip_missing_opencode_command__";
       const fetchSpy = vi.spyOn(globalThis, "fetch")
         .mockResolvedValueOnce({
           ok: true,
@@ -458,6 +469,9 @@ describe("adapter model listing", () => {
       const refreshed = await refreshAdapterModels("opencode_local");
 
       expect(fetchSpy).toHaveBeenCalledTimes(2);
+      // Both include native models.
+      expect(initial.some((m) => m.id === opencodeFallbackModels[0].id)).toBe(true);
+      expect(refreshed.some((m) => m.id === opencodeFallbackModels[0].id)).toBe(true);
       expect(initial.some((m) => m.id === "omniroute/oc/model-v1")).toBe(true);
       expect(refreshed.some((m) => m.id === "omniroute/oc/model-v2")).toBe(true);
     });
@@ -480,6 +494,70 @@ describe("adapter model listing", () => {
         { id: "omniroute/oc/claude-sonnet-4", label: "Claude Sonnet 4" },
         { id: "omniroute/auto/gpt-4o", label: "GPT-4o Auto" },
       ]);
+    });
+
+    it("native models always appear even when OpenRouter returns models", async () => {
+      process.env.OPENROUTER_BASE_URL = "http://omniroute:20129/v1";
+      process.env.OPENROUTER_API_KEY = "sk-test";
+      process.env.PAPERCLIP_OPENCODE_COMMAND = "__paperclip_missing_opencode_command__";
+      vi.spyOn(globalThis, "fetch").mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: [{ id: "oc/some-model", name: "Some Model" }],
+        }),
+      } as Response);
+
+      const models = await listAdapterModels("opencode_local");
+
+      // Native opencode fallback models are always present.
+      for (const native of opencodeFallbackModels) {
+        expect(models.some((m) => m.id === native.id)).toBe(true);
+      }
+    });
+
+    it("native models appear before OpenRouter models", async () => {
+      process.env.OPENROUTER_BASE_URL = "http://omniroute:20129/v1";
+      process.env.OPENROUTER_API_KEY = "sk-test";
+      process.env.PAPERCLIP_OPENCODE_COMMAND = "__paperclip_missing_opencode_command__";
+      vi.spyOn(globalThis, "fetch").mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: [{ id: "oc/some-model", name: "Some Model" }],
+        }),
+      } as Response);
+
+      const models = await listAdapterModels("opencode_local");
+
+      const lastNativeIdx = models.reduce(
+        (acc, m, i) => (opencodeFallbackModels.some((n) => n.id === m.id) ? i : acc),
+        -1,
+      );
+      const firstOmniIdx = models.findIndex((m) => m.id.startsWith("omniroute/"));
+      expect(lastNativeIdx).toBeLessThan(firstOmniIdx);
+    });
+
+    it("deduplicates models that appear in both native and OpenRouter lists", async () => {
+      process.env.OPENROUTER_BASE_URL = "http://omniroute:20129/v1";
+      process.env.OPENROUTER_API_KEY = "sk-test";
+      process.env.PAPERCLIP_OPENCODE_COMMAND = "__paperclip_missing_opencode_command__";
+      vi.spyOn(globalThis, "fetch").mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: [
+            { id: "oc/claude-sonnet-4", name: "Claude Sonnet 4" },
+            // Same ID as a native model — should be deduped (native wins).
+            { id: "openai/gpt-5.2-codex", name: "GPT-5.2 Codex" },
+          ],
+        }),
+      } as Response);
+
+      const models = await listAdapterModels("opencode_local");
+
+      // openai/gpt-5.2-codex appears only once (native takes precedence).
+      const gpt52Count = models.filter((m) => m.id === "openai/gpt-5.2-codex").length;
+      expect(gpt52Count).toBe(1);
+      // omniroute/openai/gpt-5.2-codex is a different ID (with prefix) so it's not a conflict.
+      expect(models.some((m) => m.id === "omniroute/openai/gpt-5.2-codex")).toBe(true);
     });
   });
 });

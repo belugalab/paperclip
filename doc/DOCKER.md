@@ -261,6 +261,60 @@ Notes:
 - Set `SMOKE_DETACH=true` to leave the container running for automation and optionally write shell-ready metadata to `SMOKE_METADATA_FILE`.
 - The image definition is in `docker/Dockerfile.onboard-smoke`.
 
+## OmniRoute Integration (LLM Gateway)
+
+When running Paperclip alongside [OmniRoute](https://github.com/belugalab/omniroute) as an LLM gateway, configure agents to use `omniroute/` prefixed model IDs (e.g. `omniroute/auto/best-free`).
+
+### Environment
+
+```sh
+OPENROUTER_BASE_URL=http://omniroute-prod:20129/v1
+OPENROUTER_API_KEY=sk-...
+PAPERCLIP_OPENCODE_SMALL_MODEL=omniroute/auto/fast
+```
+
+The `opencode_local` adapter auto-generates an OpenCode provider config by fetching the model catalog from `${OPENROUTER_BASE_URL}/models`. No static `PAPERCLIP_OPENCODE_PROVIDERS` JSON is needed.
+
+### Model Selection Notes
+
+- **Use `auto/best-free`** as the default model for agents. All `auto/*` combos in OmniRoute route to the same upstream backend (`big-pickle` via `oc` provider), so there is no functional difference between them — `auto/best-free` is simply the most tested and reliable alias.
+- **Avoid `auto/fast` and other `pro-*` / `*:pro` combos** — these can return empty responses (0 tokens) intermittently when the upstream is overloaded. This manifests as runs completing in ~3s with no work done.
+- `PAPERCLIP_OPENCODE_SMALL_MODEL` controls the title/helper model and can safely use any `auto/*` alias (title generation is a single-shot call that tolerates transient failures).
+- Agent model is set in the agent's `adapterConfig.model` field via the API or UI.
+- **Note:** `auto/best-free`, `auto/best-chat`, `auto/best-fast`, `auto/chat`, `auto/fast`, `auto/coding`, `auto/reasoning` all route to the same `big-pickle` model. The names describe combo routing intent, but currently resolve identically.
+
+### Docker Compose (shared network)
+
+```yaml
+# paperclip compose.yml
+services:
+  server:
+    env_file: .env
+    networks:
+      - omniroute
+      - internal
+
+networks:
+  omniroute:
+    external: true
+    name: omniroute
+  internal:
+    internal: true
+```
+
+```yaml
+# omniroute compose.yml
+services:
+  omniroute-prod:
+    # ...
+    networks:
+      - omniroute
+
+networks:
+  omniroute:
+    name: omniroute
+```
+
 ## General Notes
 
 - The `docker-entrypoint.sh` adjusts the container `node` user UID/GID at startup to match the values passed via `USER_UID`/`USER_GID`, avoiding permission issues on bind-mounted volumes.
