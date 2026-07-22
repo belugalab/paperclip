@@ -769,6 +769,27 @@ export function resetOpenRouterModelsCacheForTests() {
 }
 
 /**
+ * Merge multiple model lists, deduplicating by id.  Earlier sources take
+ * precedence — native adapter models should come before gateway-discovered
+ * models so the user sees the adapter's own models first.
+ */
+function mergeAdapterModels(
+  ...sources: Array<{ id: string; label: string }[]>
+): { id: string; label: string }[] {
+  const seen = new Set<string>();
+  const merged: { id: string; label: string }[] = [];
+  for (const source of sources) {
+    for (const m of source) {
+      if (!seen.has(m.id)) {
+        seen.add(m.id);
+        merged.push(m);
+      }
+    }
+  }
+  return merged;
+}
+
+/**
  * Memoized view of PAPERCLIP_ADAPTER_MODELS, keyed by the raw env string so
  * tests (and live env mutation) that change the variable are still observed.
  * Parsing happens at most once per distinct raw value instead of per
@@ -804,32 +825,54 @@ export async function listAdapterModels(type: string): Promise<{ id: string; lab
   if (declaredModels && declaredModels[type]?.length) {
     return declaredModels[type].map((m) => ({ id: m.id, label: m.label ?? m.id }));
   }
-  const openrouterModels = await fetchOpenRouterModelsFromEnv();
-  if (openrouterModels.length > 0) return openrouterModels;
+
+  // Always collect native adapter models, with fallback to static list.
   const adapter = findActiveServerAdapter(type);
-  if (!adapter) return [];
-  if (adapter.listModels) {
-    const discovered = await adapter.listModels();
-    if (discovered.length > 0) return discovered;
+  let nativeModels: { id: string; label: string }[] = [];
+  if (adapter) {
+    if (adapter.listModels) {
+      const discovered = await adapter.listModels();
+      if (discovered.length > 0) nativeModels = discovered;
+    }
+    if (nativeModels.length === 0 && adapter.models) {
+      nativeModels = adapter.models;
+    }
   }
-  return adapter.models ?? [];
+
+  // Merge with gateway-discovered models when OPENROUTER_BASE_URL is set.
+  // Native models come first so they appear at the top of the picker.
+  const openrouterModels = await fetchOpenRouterModelsFromEnv();
+  if (openrouterModels.length > 0) {
+    return mergeAdapterModels(nativeModels, openrouterModels);
+  }
+  return nativeModels;
 }
 
 export async function refreshAdapterModels(type: string): Promise<{ id: string; label: string }[]> {
   openrouterModelsCache.clear();
   const adapter = findActiveServerAdapter(type);
   if (!adapter) return [];
+
+  // Collect models from all adapter-level sources, with fallback.
+  let adapterModels: { id: string; label: string }[] = [];
   if (adapter.refreshModels) {
     const refreshed = await adapter.refreshModels();
-    if (refreshed.length > 0) return refreshed;
+    if (refreshed.length > 0) adapterModels = refreshed;
   }
-  const openrouterModels = await fetchOpenRouterModelsFromEnv();
-  if (openrouterModels.length > 0) return openrouterModels;
-  if (adapter.listModels) {
+  if (adapterModels.length === 0 && adapter.listModels) {
     const discovered = await adapter.listModels();
-    if (discovered.length > 0) return discovered;
+    if (discovered.length > 0) adapterModels = discovered;
   }
-  return adapter.models ?? [];
+  if (adapterModels.length === 0 && adapter.models) {
+    adapterModels = adapter.models;
+  }
+
+  // Merge with gateway-discovered models when OPENROUTER_BASE_URL is set.
+  const openrouterModels = await fetchOpenRouterModelsFromEnv();
+  if (openrouterModels.length > 0) {
+    return mergeAdapterModels(adapterModels, openrouterModels);
+  }
+  return adapterModels;
 }
 
 export async function listAdapterModelProfiles(type: string): Promise<AdapterModelProfileDefinition[]> {
