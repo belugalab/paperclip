@@ -1,3 +1,4 @@
+import { promises as fsPromises } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +12,18 @@ import {
   prepareSandboxManagedRuntime,
   type SandboxManagedRuntimeClient,
 } from "./sandbox-managed-runtime.js";
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    promises: {
+      ...actual.promises,
+      chmod: vi.fn(actual.promises.chmod),
+      rename: vi.fn(actual.promises.rename),
+    },
+  };
+});
 
 const execFile = promisify(execFileCallback);
 
@@ -62,6 +75,63 @@ describe("sandbox managed runtime", () => {
     await expect(readFile(path.join(targetDir, ".claude.json"), "utf8")).resolves.toBe("{\"keep\":true}\n");
     await expect(readFile(path.join(targetDir, ".paperclip-runtime", "state.json"), "utf8")).resolves.toBe("{}\n");
     await expect(readFile(path.join(targetDir, "stale.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("applies file mode on a staged sibling before renaming into place", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-copy-mode-"));
+    cleanupDirs.push(rootDir);
+    const sourceDir = path.join(rootDir, "source");
+    const targetDir = path.join(rootDir, "target");
+    const relativePath = path.join("nested", "script.sh");
+    const sourcePath = path.join(sourceDir, relativePath);
+    const targetPath = path.join(targetDir, relativePath);
+    await mkdir(path.dirname(sourcePath), { recursive: true });
+    await writeFile(sourcePath, "#!/bin/sh\necho hello\n", { mode: 0o600 });
+    await mkdir(targetDir, { recursive: true });
+
+    const chmodMock = vi.mocked(fsPromises.chmod);
+    const renameMock = vi.mocked(fsPromises.rename);
+    chmodMock.mockClear();
+    renameMock.mockClear();
+
+    await mirrorDirectory(sourceDir, targetDir);
+
+    await expect(readFile(targetPath, "utf8")).resolves.toBe("#!/bin/sh\necho hello\n");
+    expect(chmodMock).toHaveBeenCalledTimes(1);
+    expect(renameMock).toHaveBeenCalledTimes(1);
+    expect(chmodMock.mock.calls[0]?.[0]).toContain(".paperclip-copy.");
+    expect(chmodMock.mock.calls[0]?.[0]).not.toBe(targetPath);
+    expect(chmodMock.mock.invocationCallOrder[0]).toBeLessThan(renameMock.mock.invocationCallOrder[0]);
+  });
+
+  it("cleans up a staged sibling when chmod fails before rename", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-copy-cleanup-"));
+    cleanupDirs.push(rootDir);
+    const sourceDir = path.join(rootDir, "source");
+    const targetDir = path.join(rootDir, "target");
+    const relativePath = path.join("nested", "script.sh");
+    const sourcePath = path.join(sourceDir, relativePath);
+    const targetPath = path.join(targetDir, relativePath);
+    await mkdir(path.dirname(sourcePath), { recursive: true });
+    await writeFile(sourcePath, "#!/bin/sh\necho hello\n", { mode: 0o600 });
+    await mkdir(targetDir, { recursive: true });
+
+    const chmodMock = vi.mocked(fsPromises.chmod);
+    const renameMock = vi.mocked(fsPromises.rename);
+    chmodMock.mockClear();
+    renameMock.mockClear();
+    chmodMock.mockImplementationOnce(async () => {
+      throw new Error("chmod failed");
+    });
+
+    await expect(mirrorDirectory(sourceDir, targetDir)).rejects.toThrow(/chmod failed/);
+
+    expect(chmodMock).toHaveBeenCalledTimes(1);
+    expect(renameMock).not.toHaveBeenCalled();
+    const stagedPath = chmodMock.mock.calls[0]?.[0];
+    expect(stagedPath).toContain(".paperclip-copy.");
+    await expect(readFile(stagedPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(targetPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("syncs workspace and assets through a provider-neutral sandbox client", async () => {
@@ -823,5 +893,221 @@ describe("sandbox managed runtime", () => {
     const emptyArchiveCommand = runCommands.find((command) => command.includes("dd if=/dev/zero"));
     expect(emptyArchiveCommand).toBeDefined();
     expect(emptyArchiveCommand).not.toContain("/dev/null");
+  });
+
+  it("provisions a contribution-less asset via a plain tar extract and restores it as a no-op", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-default-asset-"));
+    cleanupDirs.push(rootDir);
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    const localAssetsDir = path.join(rootDir, "local-assets");
+    await mkdir(localWorkspaceDir, { recursive: true });
+    await mkdir(localAssetsDir, { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, "README.md"), "workspace\n", "utf8");
+    await writeFile(path.join(localAssetsDir, "plain.txt"), "plain asset\n", "utf8");
+
+    const stagedWrites: string[] = [];
+    const runCommands: string[] = [];
+    const client: SandboxManagedRuntimeClient = {
+      makeDir: async (remotePath) => {
+        await mkdir(remotePath, { recursive: true });
+      },
+      writeFile: async (remotePath, bytes) => {
+        await mkdir(path.dirname(remotePath), { recursive: true });
+        if (!remotePath.endsWith("-upload.tar")) stagedWrites.push(path.basename(remotePath));
+        await writeFile(remotePath, Buffer.from(bytes));
+      },
+      readFile: async (remotePath) => await readFile(remotePath),
+      listFiles: async () => [],
+      remove: async (remotePath) => {
+        await rm(remotePath, { recursive: true, force: true });
+      },
+      run: async (command) => {
+        runCommands.push(command);
+        await execFile("sh", ["-c", command], { maxBuffer: 32 * 1024 * 1024 });
+      },
+    };
+
+    const prepared = await prepareSandboxManagedRuntime({
+      spec: {
+        transport: "sandbox",
+        provider: "test",
+        sandboxId: "sandbox-1",
+        remoteCwd: remoteWorkspaceDir,
+        timeoutMs: 30_000,
+        apiKey: null,
+      },
+      adapterKey: "test-adapter",
+      client,
+      workspaceLocalDir: localWorkspaceDir,
+      // No `provision` / `restore` on the asset: it must ride the default path.
+      assets: [{ key: "plain", localDir: localAssetsDir }],
+    });
+
+    // Extracted through the default `tar -xf` path.
+    await expect(readFile(path.join(prepared.assetDirs.plain, "plain.txt"), "utf8")).resolves.toBe("plain asset\n");
+    // A contribution-less asset stages no extra files beyond its own tar.
+    expect(stagedWrites.filter((name) => name.includes("plain"))).toEqual([]);
+    // The extract command is the generic tar path, not an adapter-specific script.
+    const assetExtract = runCommands.find((command) => command.includes(`${path.posix.basename(prepared.assetDirs.plain)}-upload.tar`));
+    expect(assetExtract).toBeDefined();
+    expect(assetExtract).toContain("tar -xf");
+    expect(assetExtract).not.toMatch(/\.sh|\.cjs/);
+
+    // Restore is a clean no-op for a contribution-less asset (no throw, asset dir untouched).
+    await expect(prepared.restoreWorkspace()).resolves.toBeUndefined();
+    await expect(readFile(path.join(prepared.assetDirs.plain, "plain.txt"), "utf8")).resolves.toBe("plain asset\n");
+  });
+
+  it("round-trips a non-codex asset through generic provision + restore contributions", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-seam-"));
+    cleanupDirs.push(rootDir);
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    const localAssetsDir = path.join(rootDir, "local-assets");
+    await mkdir(localWorkspaceDir, { recursive: true });
+    await mkdir(localAssetsDir, { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, "README.md"), "workspace\n", "utf8");
+    await writeFile(path.join(localAssetsDir, "seed.txt"), "seed\n", "utf8");
+
+    const client: SandboxManagedRuntimeClient = {
+      makeDir: async (remotePath) => {
+        await mkdir(remotePath, { recursive: true });
+      },
+      writeFile: async (remotePath, bytes) => {
+        await mkdir(path.dirname(remotePath), { recursive: true });
+        await writeFile(remotePath, Buffer.from(bytes));
+      },
+      readFile: async (remotePath) => await readFile(remotePath),
+      listFiles: async () => [],
+      remove: async (remotePath) => {
+        await rm(remotePath, { recursive: true, force: true });
+      },
+      run: async (command) => {
+        await execFile("sh", ["-c", command], { maxBuffer: 32 * 1024 * 1024 });
+      },
+    };
+
+    // A minimal shell quoter local to the test's custom extract command; the seam
+    // itself carries no adapter knowledge — the fake asset supplies everything.
+    const q = (value: string) => `'${value.replace(/'/g, `'\"'\"'`)}'`;
+    const restored: string[] = [];
+    const stagedContentSeen: string[] = [];
+
+    const prepared = await prepareSandboxManagedRuntime({
+      spec: {
+        transport: "sandbox",
+        provider: "test",
+        sandboxId: "sandbox-1",
+        remoteCwd: remoteWorkspaceDir,
+        timeoutMs: 30_000,
+        apiKey: null,
+      },
+      adapterKey: "generic-adapter",
+      client,
+      workspaceLocalDir: localWorkspaceDir,
+      assets: [{
+        key: "widget",
+        localDir: localAssetsDir,
+        provision: {
+          stageFiles: [{ name: "widget-helper.txt", contents: "helper-bytes\n" }],
+          // Extract the asset AND consume the staged helper file, proving both
+          // stageFiles and extractCommand flow through the core generically.
+          extractCommand: ({ assetTarPath, assetDir, runtimeRootDir }) =>
+            `rm -rf ${q(assetDir)} && mkdir -p ${q(assetDir)} && ` +
+            `tar -xf ${q(assetTarPath)} -C ${q(assetDir)} && rm -f ${q(assetTarPath)} && ` +
+            `cp ${q(path.posix.join(runtimeRootDir, "widget-helper.txt"))} ${q(path.posix.join(assetDir, "helper.copied.txt"))}`,
+        },
+        restore: async ({ assetDir, readFile: readRemote }) => {
+          const bytes = await readRemote(path.posix.join(assetDir, "refreshed.txt"));
+          restored.push(bytes.toString("utf8"));
+        },
+      }],
+    });
+
+    // provision: the asset's own content extracted...
+    await expect(readFile(path.join(prepared.assetDirs.widget, "seed.txt"), "utf8")).resolves.toBe("seed\n");
+    // ...the staged helper file was written to the runtime root and consumed by the custom extract command.
+    await expect(readFile(path.join(prepared.assetDirs.widget, "helper.copied.txt"), "utf8")).resolves.toBe("helper-bytes\n");
+    stagedContentSeen.push("provisioned");
+
+    // Simulate the sandbox refreshing a file inside the asset dir, then restore.
+    await writeFile(path.join(prepared.assetDirs.widget, "refreshed.txt"), "refreshed-by-sandbox\n", "utf8");
+    await prepared.restoreWorkspace();
+
+    // restore contribution was invoked with a working remote readFile against assetDir.
+    expect(restored).toEqual(["refreshed-by-sandbox\n"]);
+    expect(stagedContentSeen).toEqual(["provisioned"]);
+  });
+
+  it("rejects a provision stageFile.name that is not a simple basename", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-traversal-"));
+    cleanupDirs.push(rootDir);
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    const localAssetsDir = path.join(rootDir, "local-assets");
+    await mkdir(localWorkspaceDir, { recursive: true });
+    await mkdir(localAssetsDir, { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, "README.md"), "workspace\n", "utf8");
+    await writeFile(path.join(localAssetsDir, "seed.txt"), "seed\n", "utf8");
+
+    const writtenPaths: string[] = [];
+    const client: SandboxManagedRuntimeClient = {
+      makeDir: async (remotePath) => {
+        await mkdir(remotePath, { recursive: true });
+      },
+      writeFile: async (remotePath, bytes) => {
+        writtenPaths.push(remotePath);
+        await mkdir(path.dirname(remotePath), { recursive: true });
+        await writeFile(remotePath, Buffer.from(bytes));
+      },
+      readFile: async (remotePath) => await readFile(remotePath),
+      listFiles: async () => [],
+      remove: async (remotePath) => {
+        await rm(remotePath, { recursive: true, force: true });
+      },
+      run: async (command) => {
+        await execFile("sh", ["-c", command], { maxBuffer: 32 * 1024 * 1024 });
+      },
+    };
+
+    // A compromised adapter supplying a traversal name must be rejected before
+    // the core ever writes outside the runtime root.
+    for (const maliciousName of ["../evil.txt", "..", "nested/child.txt", "back\\slash.txt", "../../etc/passwd"]) {
+      writtenPaths.length = 0;
+      await expect(
+        prepareSandboxManagedRuntime({
+          spec: {
+            transport: "sandbox",
+            provider: "test",
+            sandboxId: "sandbox-1",
+            remoteCwd: remoteWorkspaceDir,
+            timeoutMs: 30_000,
+            apiKey: null,
+          },
+          adapterKey: "generic-adapter",
+          client,
+          workspaceLocalDir: localWorkspaceDir,
+          assets: [{
+            key: "widget",
+            localDir: localAssetsDir,
+            provision: {
+              stageFiles: [{ name: maliciousName, contents: "payload\n" }],
+            },
+          }],
+        }),
+      ).rejects.toThrow(/must be a simple basename/);
+
+      // The guard fires before the offending write, so nothing landed under the runtime root.
+      expect(writtenPaths.some((p) => p.endsWith("evil.txt") || p.endsWith("passwd") || p.endsWith("child.txt"))).toBe(false);
+    }
+  });
+
+  it("keeps the sandbox runtime core free of Codex-specific string literals", async () => {
+    const coreSource = await readFile(new URL("./sandbox-managed-runtime.ts", import.meta.url), "utf8");
+    // The seam must be generic: no adapter (Codex) knowledge may live in the core.
+    expect(coreSource).not.toMatch(/codex/i);
+    expect(coreSource).not.toMatch(/auth\.json/i);
+    expect(coreSource).not.toMatch(/merge-extract|merge-decision/i);
   });
 });

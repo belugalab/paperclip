@@ -63,6 +63,15 @@ export type {
   AttentionSubjectKind,
   AttentionWorkspaceRef,
 } from "./types/attention.js";
+export type {
+  DecisionTrainingExample,
+  DecisionTrainingNotesHistoryEntry,
+  DecisionTrainingPreview,
+  DecisionTrainingRetentionPolicy,
+  DecisionTrainingSnapshotV1,
+  DecisionTrainingSourceKind,
+} from "./types/decision-training.js";
+export { DECISION_TRAINING_RETENTION_POLICY } from "./types/decision-training.js";
 
 export type {
   PipelineAutomationRetryBlocker,
@@ -134,15 +143,17 @@ export {
   type SourceTrustMetadata,
 } from "./trust-policy.js";
 export {
-  TOOL_APP_GALLERY,
-  getToolAppGalleryEntry,
-  getToolAppGalleryEntryForUrl,
-  type AppGalleryAuthKind,
-  type AppGalleryCredentialField,
-  type AppGalleryEntry,
-  type AppGalleryKey,
-  type AppGalleryTransportTemplate,
-} from "./tool-app-gallery.js";
+  CONNECTABLE_APP_DEFINITIONS,
+  DEFAULT_OWNERSHIP_AVAILABILITY,
+  credentialConfigPath,
+  getAppDefinitionForUrl,
+  getAvailableConnectionMethod,
+  getConnectableAppDefinition,
+  recommendedDefaultsForApp,
+} from "./app-definitions.js";
+export { APP_DEFINITIONS } from "./app-definitions.generated.js";
+export * from "./validators/status-card.js";
+export { appDefinitionSchema, appDefinitionsSchema, connectionMethodDefSchema } from "./validators/app-definition.js";
 export {
   humanizeConnectionDisplayName,
   connectionDisplaySecondaryHint,
@@ -173,6 +184,9 @@ export {
   ISSUE_WORK_MODES,
   ISSUE_HARNESS_KINDS,
   MAX_ISSUE_REQUEST_DEPTH,
+  SUMMARY_SLOT_SCOPE_KINDS,
+  SUMMARY_SLOT_KEYS,
+  SUMMARY_SLOT_STATUSES,
   ISSUE_COMMENT_AUTHOR_TYPES,
   ISSUE_COMMENT_METADATA_ROW_TYPES,
   ISSUE_COMMENT_PRESENTATION_KINDS,
@@ -212,6 +226,7 @@ export {
   ISSUE_EXECUTION_STAGE_TYPES,
   ISSUE_MONITOR_SCHEDULED_BY,
   ISSUE_EXECUTION_MONITOR_KINDS,
+  PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
   ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES,
   ISSUE_EXECUTION_STATE_STATUSES,
   ISSUE_EXECUTION_MONITOR_STATE_STATUSES,
@@ -353,6 +368,9 @@ export {
   type IssuePriority,
   type IssueWorkMode,
   type IssueHarnessKind,
+  type SummarySlotScopeKind,
+  type SummarySlotKey,
+  type SummarySlotStatus,
   type IssueCommentAuthorType,
   type IssueCommentMetadataRowType,
   type IssueCommentPresentationKind,
@@ -481,6 +499,19 @@ export {
 } from "./constants.js";
 
 export {
+  generateSummarySlotSchema,
+  summarySlotKeySchema,
+  summarySlotQuerySchema,
+  summarySlotScopeKindSchema,
+  summarySlotScopeSelectorSchema,
+  summarySlotStatusSchema,
+  writeSummarySlotSchema,
+  type GenerateSummarySlotInput,
+  type SummarySlotScopeSelectorInput,
+  type WriteSummarySlotInput,
+} from "./validators/summary-slot.js";
+
+export {
   ALL_INTERFACES_BIND_HOST,
   LOOPBACK_BIND_HOST,
   inferBindModeFromHost,
@@ -501,6 +532,17 @@ export {
 
 export type {
   Company,
+  GenerateSummarySlotRequest,
+  GenerateSummarySlotResponse,
+  GetSummarySlotResponse,
+  ListSummarySlotRevisionsResponse,
+  SummarySlot,
+  SummarySlotDocument,
+  SummarySlotIssueRef,
+  SummarySlotRevision,
+  SummarySlotScopeSelector,
+  WriteSummarySlotRequest,
+  WriteSummarySlotResponse,
   Environment,
   EnvironmentDeleteBlastRadius,
   EnvironmentDeleteBlockedReason,
@@ -628,8 +670,11 @@ export type {
   AgentSkillSyncRequest,
   InstanceExecutionMode,
   InstanceExperimentalSettings,
+  InstanceExperimentalSettingsWithManaged,
   InstanceGeneralSettings,
   InstanceSettings,
+  ManagedExperimentalFeatureKey,
+  ManagedSettingMetadata,
   IssueGraphLivenessAutoRecoveryPreview,
   IssueGraphLivenessAutoRecoveryPreviewItem,
   BackupRetentionPolicy,
@@ -789,6 +834,8 @@ export type {
   IssueInboxAttentionKind,
   IssueBlockedInboxAction,
   IssueBlockedInboxAttention,
+  IssueUnblockDescriptor,
+  IssueUnblockOwner,
   IssueBlockedInboxIssueRef,
   IssueBlockedInboxOwner,
   IssueBlockedInboxOwnerType,
@@ -1068,6 +1115,8 @@ export type {
   ToolCallEvent,
   ToolCatalogEntryKind,
   ToolConnectionHealthStatus,
+  ToolConnectionAuthKind,
+  ToolConnectionOwnership,
   ToolConnectionTransport,
   ToolConnectionStatus,
   ToolConnectionKind,
@@ -1091,6 +1140,9 @@ export type {
   ToolConnectionInstall,
   ToolConnectionInstallSnapshot,
   ToolConnectionInstallTargetType,
+  ConnectionGrant,
+  ConnectionGrantKind,
+  ConnectionGrantStatus,
   ConnectionTokenScope,
   ConnectionTokenRequest,
   ConnectionTokenAttribution,
@@ -1212,6 +1264,9 @@ export type {
   PluginJobRecord,
   PluginJobRunRecord,
   PluginWebhookDeliveryRecord,
+  AppDefinition,
+  ConnectionMethodDef,
+  FieldDef,
   QuotaWindow,
   ProviderQuotaResult,
 } from "./types/index.js";
@@ -1265,9 +1320,21 @@ export {
 } from "./validators/sidebar-preferences.js";
 export {
   resourceMembershipStateSchema,
+  updateDocumentResourceMembershipSchema,
   updateResourceMembershipSchema,
+  type UpdateDocumentResourceMembership,
   type UpdateResourceMembership,
 } from "./validators/resource-memberships.js";
+export {
+  inboxAgentPolicyModeSchema,
+  updateInboxAgentPolicySchema,
+  type UpdateInboxAgentPolicy,
+} from "./validators/inbox-agent-policy.js";
+export {
+  INBOX_AGENT_POLICY_MODES,
+  type InboxAgentPolicyMode,
+  type InboxAgentPolicy,
+} from "./types/inbox-agent-policy.js";
 export {
   RESOURCE_MEMBERSHIP_STATES,
   type ResourceMembershipResourceType,
@@ -1302,6 +1369,7 @@ export {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
+  PAPERCLIP_CLOUD_MANAGED_BY,
 } from "./types/instance.js";
 
 export type {
@@ -1350,6 +1418,8 @@ export {
   patchInstanceGeneralSettingsSchema,
   type PatchInstanceGeneralSettings,
   instanceExperimentalSettingsSchema,
+  instanceExperimentalSettingsWithManagedSchema,
+  managedSettingMetadataSchema,
   patchInstanceExperimentalSettingsSchema,
   patchInstanceSettingsSchema,
   issueGraphLivenessAutoRecoveryRequestSchema,
@@ -1547,6 +1617,7 @@ export {
   acceptIssueThreadInteractionSchema,
   rejectIssueThreadInteractionSchema,
   cancelIssueThreadInteractionSchema,
+  withdrawIssueThreadInteractionSchema,
   respondIssueThreadInteractionSchema,
   submitIssueThreadInteractionVerdictsSchema,
   linkIssueApprovalSchema,
@@ -1609,6 +1680,7 @@ export {
   type AcceptIssueThreadInteraction,
   type RejectIssueThreadInteraction,
   type CancelIssueThreadInteraction,
+  type WithdrawIssueThreadInteraction,
   type RespondIssueThreadInteraction,
   type SubmitIssueThreadInteractionVerdicts,
   type LinkIssueApproval,
@@ -1718,6 +1790,8 @@ export {
   toolTrustRuleBatchApprovalSchema,
   toolTrustRuleScopeSchema,
   connectionTokenRequestSchema,
+  connectionTokenSubjectSchema,
+  startConnectionAuthorizationSchema,
   toolConnectionTestCallSchema,
   toolPolicyTestRequestSchema,
   importMcpJsonSchema,
@@ -2100,12 +2174,40 @@ export type {
 } from "./environment-support.js";
 
 export type { AdapterRegistryEntry } from "./types/adapter-registry.js";
+export type {
+  FolderKind,
+  Folder,
+  FolderListItem,
+  FolderListResult,
+  CreateFolderRequest,
+  UpdateFolderRequest,
+  MoveFolderRequest,
+  MoveFolderItemRequest,
+  EnsureMySkillFolderRequest,
+} from "./types/folder.js";
 
 export {
   adapterRegistryEntrySchema,
   adapterRegistrySchema,
   type AdapterRegistryEntryParsed,
 } from "./validators/adapter-registry.js";
+export {
+  folderKindSchema,
+  folderSlugSchema,
+  folderSchema,
+  folderListItemSchema,
+  folderListResultSchema,
+  createFolderSchema,
+  updateFolderSchema,
+  moveFolderSchema,
+  moveFolderItemSchema,
+  ensureMySkillFolderSchema,
+  type CreateFolder,
+  type UpdateFolder,
+  type MoveFolder,
+  type MoveFolderItem,
+  type EnsureMySkillFolder,
+} from "./validators/folder.js";
 
 export {
   environmentCustomImageTemplateKindSchema,
@@ -2130,3 +2232,15 @@ export {
   type EnvironmentCustomImageTerminalSessionToken,
 } from "./validators/environment-custom-images.js";
 export * from "./validators/skill-policy.js";
+export {
+  FEATURE_TIERS,
+  INSTANCE_FEATURE_CATALOG,
+  INSTANCE_FEATURE_KEYS,
+  buildFeatureCatalogArtifact,
+  featureCatalogArtifactSchema,
+  renderFeatureCatalogArtifact,
+  type FeatureCatalogArtifact,
+  type FeatureCatalogEntry,
+  type FeatureTier,
+  type InstanceFeatureKey,
+} from "./feature-catalog.js";

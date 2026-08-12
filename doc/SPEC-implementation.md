@@ -543,6 +543,8 @@ Detailed ownership, execution, blocker, active-run watchdog, crash-recovery, and
 | Report cost | yes | yes |
 | Set company budget | yes | no |
 | Set subordinate budget | yes | yes (manager subtree only) |
+| Manage responsible user's inbox state | yes | yes (default-open policy) |
+| Manage another user's inbox state | yes | scoped `inbox:manage` grant |
 | Set work-object visibility (issue/project) | no | no (pro gate) |
 
 ## 9.4 Permission Terminology and Default Visibility Rule
@@ -576,6 +578,7 @@ The approved term set is:
 | Work-object visibility | All issues and projects in-company are visible to board and agents | Project/issue ACLs and reviewer-only channels |
 | Tool/secret policy | Secret refs, log redaction, and adapter-level command/webhook restrictions | Tool allowlists with centralized policy evaluation |
 | Company skills | Open to authenticated company agents; core enforces invariants and any stored restriction policy | Paperclip EE policy editor, protected-skill controls, presets, simulation, and policy audit UX |
+| Inbox management | Responsible agent may archive/unarchive its responsible user's Mine items under a default-open user policy; cross-user access requires `inbox:manage`; all mutations are audited | Policy administration UX, organization presets, simulations, bulk controls, and richer audit/reporting surfaces |
 | Escalation | Escalate from agent to manager to board; board approval/budget gates remain authoritative | Escalation routing and SLA windows |
 
 ## 9.7 Recommended first-slice implementation order
@@ -622,6 +625,21 @@ Within the watched subtree, a watchdog run may perform only mutations that resto
 
 Every watchdog-triggered mutation must write activity with the watchdog id, source issue id, watchdog issue id when present, run id, and stop fingerprint. Mutations still use the normal status-transition, blocker, assignment, budget, and company-boundary guards.
 
+### Atomic recovery batch
+
+A watchdog run may submit an atomic recovery batch of at most 3 mutations drawn from the allowed-mutation list above, validated against the stop fingerprint that run observed. The server applies the batch all-or-nothing: if the subtree's stop fingerprint changed between observation and application — the subtree went live concurrently — the entire remainder of the batch is aborted and the staleness is recorded as evidence on the reusable watchdog issue. The batch is single-shot per watchdog run. This replaces the exactly-one-fresh-write model: the stale-guard's purpose (never mutate a subtree that concurrently went live) is preserved by fingerprint validation on the whole batch rather than by capping the run at one write, so a restoration that needs both a state-restoring `PATCH` and an explanatory comment cannot forfeit the restoration by ordering the comment first.
+
+### Restoration verification and escalation
+
+Reviewed-fingerprint suppression is disposition-aware. A watchdog disposition of "stopped state is legitimate" suppresses re-fire for that fingerprint as today. A disposition of "live path restored" arms a bounded verification instead:
+
+- if a later scan observes the subtree stopped with a fingerprint equal to the one the restoration claimed to fix, the watchdog re-fires with an incremented attempt count for that fingerprint lineage
+- restoration-attempt lineage (attempt number, claimed-fixed fingerprint, restoration actions) is persisted durable watchdog state
+- the stop fingerprint (or the lineage check) must account for intermediate-node durable updates so a restoration that changes no stopped leaf is classified as a failed restoration, not as a reviewed stop
+- after N attempts (N = 2–3, configuration-bounded) on the same fingerprint lineage, the platform stops re-firing and escalates to a human — the watchdog owner or a board notification — with the attempt history attached
+
+Escalation is terminal for the automatic loop: no further watchdog wakes fire for that lineage until a human or a new durable subtree change produces a different fingerprint.
+
 ### Disallowed watchdog mutations
 
 A task watchdog must not:
@@ -665,6 +683,8 @@ Implementation, security, UI, and QA work for task watchdogs must prove these co
 - plan-confirmation tests cover stale document revisions, missing purpose markers, outside-subtree targets, governed actions, newer user comments, and explicit human/CTO/Security reservations
 - scheduler tests prove live runs, queued wakes, and scheduled retries suppress watchdog wakeups, while terminal, cancelled, blocked, and review leaves are still verified when the subtree has no live path
 - tests prove `task_watchdog` origin issues and descendants are excluded from scans so watchdogs do not trigger themselves
+- recovery-batch tests prove batches are capped at 3 allowed mutations, applied all-or-nothing, and aborted with recorded evidence when the observed stop fingerprint went stale mid-batch
+- restoration-verification tests prove a "live path restored" disposition re-fires on an unchanged fingerprint with an incremented attempt count, a failed intermediate-node restoration is not treated as a reviewed stop, and the N-attempt bound escalates to a human with attempt history instead of firing forever
 - regression tests prove watchdog capability discovery comes from wake metadata/denials and denied probes do not create visible issues
 - UI copy and badges distinguish task watchdogs from active-run output watchdogs, monitors, reviewers, approvers, and liveness recovery
 - prompt/context tests prove custom instructions are appended after non-overridable safety constraints and cannot expand authority
@@ -785,6 +805,24 @@ Phase 2 server tests and Phase 4 UI tests must prove:
 - policy mutation, policy reset, and cross-principal policy simulation require board administration authority or `users:manage_permissions`; ordinary open-default skill access never grants those actions
 - explicit policy denials return `skill_policy_denied`, while platform safety failures return the stable invariant denial codes above
 - successful skill mutations and policy mutations persist activity records with actor, company, run attribution, normalized action, and revision/change summary; audit-write failures do not leave successful unaudited mutations behind
+
+## 9.11 Inbox Management Permission and Ownership Contract
+
+`inbox:manage` is the permission key for agent-driven per-user inbox archive state. Inbox archive state changes presentation in a user's Mine inbox; it does not change issue status, assignment, visibility, or the underlying work record.
+
+Core authorization follows these rules:
+
+- Board users may archive or unarchive inbox entries for users in the company.
+- An agent may manage the responsible user's inbox without an explicit grant when the authenticated run resolves that user and the user's inbox-agent policy permits the agent. This is the default-open path.
+- A user may set inbox-agent policy to `disabled` or `allowlist`. Policy restrictions override the default-open path, and low-trust agents are denied.
+- An agent targeting any user other than its resolved responsible user requires an explicit `inbox:manage` grant. Grants may be unscoped or constrained by `scope.userIds`.
+- Archive and unarchive operations are company-scoped, reversible, and activity logged with actor, agent, run, target user, target-resolution source, and policy mode.
+- New qualifying issue activity may invalidate an archive so the item resurfaces; archival is not a substitute for resolving or closing work.
+
+Ownership split:
+
+- **Core / Free:** permission key and scoped-grant enforcement; responsible-user resolution; default-open, disabled, and allowlist policy modes; archive/unarchive APIs; per-user archive persistence; resurfacing behavior; activity audit records; and stable denial codes.
+- **Paperclip EE / Enterprise:** centralized policy administration beyond the per-user controls, organization-wide presets, policy simulation, bulk inbox operations, advanced compliance reporting, and richer administrative audit UX. EE may extend policy management surfaces but must not weaken core company boundaries, user policy restrictions, scoped grants, or audit requirements.
 
 ## 10. API Contract (REST)
 

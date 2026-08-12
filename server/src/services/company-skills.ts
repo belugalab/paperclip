@@ -97,6 +97,7 @@ import { issueDocumentSelect, mapIssueDocumentRow } from "./documents.js";
 import { toIssueWorkProduct } from "./work-products.js";
 import { projectService } from "./projects.js";
 import { normalizePortablePath } from "./portable-path.js";
+import { folderService } from "./folders.js";
 import {
   copyCatalogSkillFile,
   getCatalogPackageMetadata,
@@ -119,6 +120,7 @@ type CompanySkillListDbRow = Pick<
   CompanySkillRow,
   | "id"
   | "companyId"
+  | "folderId"
   | "key"
   | "slug"
   | "name"
@@ -151,6 +153,8 @@ type CompanySkillListRow = Pick<
   CompanySkill,
   | "id"
   | "companyId"
+  | "folderId"
+  | "folderPath"
   | "key"
   | "slug"
   | "name"
@@ -213,6 +217,7 @@ type ImportedSkill = {
 type ImportedSkillPersistValues = Pick<
   CompanySkill,
   | "companyId"
+  | "folderId"
   | "key"
   | "slug"
   | "name"
@@ -361,6 +366,22 @@ type SkillActor = {
   userId?: string | null;
 };
 
+type BundledSkillReleaseManifestEntry = {
+  id: string;
+  releaseName: string;
+  releasedAt: string;
+  notes: string;
+  dir: string;
+};
+
+type CreateVersionOptions = {
+  fileInventory?: CompanySkillVersionFileInventoryEntry[];
+  release?: { id: string; name: string; releasedAt: Date };
+  updateCurrentVersion?: boolean;
+  skipInventoryRefresh?: boolean;
+  skill?: CompanySkill;
+};
+
 type PlannedSkillReassignment = {
   agentId: string;
   reassignment: CompanySkillForkReassignment;
@@ -376,6 +397,7 @@ function selectCompanySkillColumns() {
   return {
     id: companySkills.id,
     companyId: companySkills.companyId,
+    folderId: companySkills.folderId,
     key: companySkills.key,
     slug: companySkills.slug,
     name: companySkills.name,
@@ -880,6 +902,15 @@ function resolveBundledSkillsRoot() {
   ];
 }
 
+function resolveBundledSkillReleasesRoot() {
+  const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+  return [
+    path.resolve(moduleDir, "../../skills-releases/paperclip"),
+    path.resolve(process.cwd(), "skills-releases/paperclip"),
+    path.resolve(moduleDir, "../../../skills-releases/paperclip"),
+  ];
+}
+
 function matchesRequestedSkill(relativeSkillPath: string, requestedSkillSlug: string | null) {
   if (!requestedSkillSlug) return true;
   const skillDir = path.posix.dirname(relativeSkillPath);
@@ -1208,6 +1239,26 @@ function isPaperclipBundledSkillKey(key: string) {
   return key.startsWith("paperclipai/paperclip/");
 }
 
+function paperclipBundledFolderCategory(key: string, metadata?: unknown) {
+  const keyParts = key.split("/");
+  if (keyParts[0] === "paperclipai" && keyParts[1] === "bundled" && keyParts[2]) {
+    return keyParts[2];
+  }
+  if (isPaperclipBundledSkillKey(key)) return "paperclip-core";
+  if (isPlainRecord(metadata) && asString(metadata.sourceKind) === "paperclip_bundled") {
+    return "paperclip-core";
+  }
+  return null;
+}
+
+function bundledFolderLabel(category: string) {
+  return category
+    .split(/[-_\s]+/)
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
 function stripDerivedPaperclipBundledMetadata(key: string, metadata: unknown): unknown {
   if (metadata === null || metadata === undefined) return {};
   const comparable = stableJsonComparable(metadata);
@@ -1239,6 +1290,7 @@ function importedSkillPersistValuesMatchExisting(
   values: ImportedSkillPersistValues,
 ) {
   return existing.companyId === values.companyId
+    && existing.folderId === values.folderId
     && existing.key === values.key
     && existing.slug === values.slug
     && existing.name === values.name
@@ -1756,6 +1808,9 @@ function toCompanySkillVersion(row: CompanySkillVersionRow): CompanySkillVersion
   return {
     ...row,
     label: row.label ?? null,
+    releaseId: row.releaseId ?? null,
+    releaseName: row.releaseName ?? null,
+    releasedAt: row.releasedAt ?? null,
     fileInventory: Array.isArray(row.fileInventory)
       ? row.fileInventory.flatMap((entry) => {
         if (!isPlainRecord(entry)) return [];
@@ -2643,6 +2698,8 @@ function toCompanySkillListItem(skill: CompanySkillListRow, attachedAgentCount: 
   return {
     id: skill.id,
     companyId: skill.companyId,
+    folderId: skill.folderId,
+    folderPath: skill.folderPath ?? null,
     key: skill.key,
     slug: skill.slug,
     name: skill.name,
@@ -2743,6 +2800,7 @@ async function listLastEditorsBySkillId(
 }
 
 export function companySkillService(db: Db) {
+  const folderSvc = folderService(db);
   const agents = agentService(db);
   const projects = projectService(db);
 
@@ -2796,6 +2854,122 @@ export function companySkillService(db: Db) {
       return upsertImportedSkills(companyId, bundledSkills);
     }
     return [];
+  }
+
+  async function readBundledSkillReleaseRegistry() {
+    for (const registryRoot of resolveBundledSkillReleasesRoot()) {
+      const manifestPath = path.join(registryRoot, "releases.json");
+      const manifestText = await fs.readFile(manifestPath, "utf8").catch(() => null);
+      if (!manifestText) continue;
+      const parsed = JSON.parse(manifestText) as unknown;
+      if (!Array.isArray(parsed)) throw new Error(`Invalid bundled skill release manifest: ${manifestPath}`);
+      return parsed.map((entry): BundledSkillReleaseManifestEntry & { releaseDir: string } => {
+        if (!isPlainRecord(entry)) throw new Error(`Invalid bundled skill release entry: ${manifestPath}`);
+        const id = asString(entry.id);
+        const releaseName = asString(entry.releaseName);
+        const releasedAt = asString(entry.releasedAt);
+        const notes = asString(entry.notes);
+        const dir = asString(entry.dir);
+        if (!id || !releaseName || !releasedAt || !notes || !dir) {
+          throw new Error(`Incomplete bundled skill release entry: ${manifestPath}`);
+        }
+        const releaseDir = path.resolve(registryRoot, dir);
+        const relativeReleaseDir = path.relative(registryRoot, releaseDir);
+        if (relativeReleaseDir.startsWith("..") || path.isAbsolute(relativeReleaseDir)) {
+          throw new Error(`Bundled skill release directory escapes registry root: ${dir}`);
+        }
+        return { id, releaseName, releasedAt, notes, dir, releaseDir };
+      });
+    }
+    return [];
+  }
+
+  async function collectVersionFileInventoryFromDirectory(
+    skillDir: string,
+  ): Promise<CompanySkillVersionFileInventoryEntry[]> {
+    const inventory = await collectLocalSkillInventory(skillDir);
+    return Promise.all(inventory.map(async (entry) => ({
+      ...entry,
+      content: await fs.readFile(path.join(skillDir, entry.path), "utf8"),
+    })));
+  }
+
+  async function ensureBundledSkillReleases(companyId: string, bundledSkills: CompanySkill[]) {
+    const paperclipSkill = bundledSkills.find((skill) => skill.key === "paperclipai/paperclip/paperclip");
+    if (!paperclipSkill) return;
+    for (const release of await readBundledSkillReleaseRegistry()) {
+      const fileInventory = serializeVersionFileInventory(
+        await collectVersionFileInventoryFromDirectory(release.releaseDir),
+      );
+      const existing = await db
+        .select()
+        .from(companySkillVersions)
+        .where(and(
+          eq(companySkillVersions.companyId, companyId),
+          eq(companySkillVersions.companySkillId, paperclipSkill.id),
+          eq(companySkillVersions.releaseId, release.id),
+        ))
+        .then((rows) => rows[0] ?? null);
+      if (existing) {
+        const existingInventory = toCompanySkillVersion(existing).fileInventory;
+        const existingHash = buildInventoryContentHash(existingInventory.map((entry) => ({
+          path: entry.path,
+          sha256: sha256Buffer(entry.content),
+        })));
+        const registryHash = buildInventoryContentHash(fileInventory.map((entry) => ({
+          path: entry.path,
+          sha256: sha256Buffer(entry.content),
+        })));
+        if (existingHash !== registryHash) {
+          throw new Error(`Bundled skill release ${release.id} does not match its seeded snapshot.`);
+        }
+        continue;
+      }
+      const releasedAt = new Date(release.releasedAt);
+      if (Number.isNaN(releasedAt.getTime())) {
+        throw new Error(`Invalid bundled skill release date: ${release.releasedAt}`);
+      }
+      await createVersion(companyId, paperclipSkill.id, { label: release.releaseName }, null, {
+        fileInventory,
+        release: { id: release.id, name: release.releaseName, releasedAt },
+        updateCurrentVersion: false,
+        skipInventoryRefresh: true,
+        skill: paperclipSkill,
+      });
+    }
+  }
+
+  async function reconcilePaperclipSkillFolders(companyId: string) {
+    const shippedSkills = await db
+      .select({
+        id: companySkills.id,
+        key: companySkills.key,
+        folderId: companySkills.folderId,
+        metadata: companySkills.metadata,
+      })
+      .from(companySkills)
+      .where(eq(companySkills.companyId, companyId))
+      .then((rows) => rows.flatMap((skill) => {
+        const category = paperclipBundledFolderCategory(skill.key, skill.metadata);
+        return category ? [{ ...skill, category }] : [];
+      }));
+    const foldersByCategory = new Map<string, Awaited<ReturnType<typeof folderSvc.ensureBundledCategory>>>();
+    for (const skill of shippedSkills) {
+      let folder = foldersByCategory.get(skill.category);
+      if (!folder) {
+        folder = await folderSvc.ensureBundledCategory(companyId, bundledFolderLabel(skill.category));
+        foldersByCategory.set(skill.category, folder);
+      }
+      if (skill.folderId === folder.id) continue;
+      await db
+        .update(companySkills)
+        .set({ folderId: folder.id, updatedAt: new Date() })
+        .where(and(eq(companySkills.companyId, companyId), eq(companySkills.id, skill.id)));
+    }
+    await folderSvc.pruneEmptyBundledCategories(
+      companyId,
+      Array.from(foldersByCategory.keys(), bundledFolderLabel),
+    );
   }
 
   async function reconcileLocalPathSkillSources(companyId: string) {
@@ -2888,7 +3062,9 @@ export function companySkillService(db: Db) {
       if (!companyExists) {
         throw notFound("Company not found");
       }
-      await ensureBundledSkills(companyId);
+      const bundledSkills = await ensureBundledSkills(companyId);
+      await ensureBundledSkillReleases(companyId, bundledSkills);
+      await reconcilePaperclipSkillFolders(companyId);
       await reconcileLocalPathSkillSources(companyId);
     })();
 
@@ -2904,10 +3080,11 @@ export function companySkillService(db: Db) {
 
   async function list(companyId: string, query: CompanySkillListQuery = {}): Promise<CompanySkillListItem[]> {
     await ensureSkillInventoryCurrent(companyId);
-    const rows = await db
+    const [dbRows, folderListing] = await Promise.all([db
       .select({
         id: companySkills.id,
         companyId: companySkills.companyId,
+        folderId: companySkills.folderId,
         key: companySkills.key,
         slug: companySkills.slug,
         name: companySkills.name,
@@ -2939,7 +3116,21 @@ export function companySkillService(db: Db) {
       .from(companySkills)
       .where(eq(companySkills.companyId, companyId))
       .orderBy(asc(companySkills.name), asc(companySkills.key))
-      .then((entries) => entries.map((entry) => toCompanySkillListRow(entry as CompanySkillListDbRow)));
+      .then((entries) => entries.map((entry) => toCompanySkillListRow(entry as CompanySkillListDbRow))),
+      folderSvc.list(companyId, "skill"),
+    ]);
+    const folderPaths = new Map(folderListing.folders.map((folder) => [folder.id, folder.path]));
+    const rows = dbRows.map((skill) => ({
+      ...skill,
+      folderPath: skill.folderId ? folderPaths.get(skill.folderId) ?? null : null,
+    }));
+    let selectedFolderIds: Set<string> | null = null;
+    if (query.folderId) {
+      await folderSvc.validateSkillFolder(companyId, query.folderId, { allowBundled: true });
+      selectedFolderIds = query.includeSubtree
+        ? await folderSvc.descendantIds(companyId, "skill", query.folderId)
+        : new Set([query.folderId]);
+    }
     const agentRows = await agents.list(companyId);
     const q = query.q?.trim().toLowerCase() ?? "";
     const categories = new Set(
@@ -2950,6 +3141,7 @@ export function companySkillService(db: Db) {
     );
     const filtered = rows.filter((skill) => {
       if (query.scope && skill.sharingScope !== query.scope) return false;
+      if (!q && selectedFolderIds && (!skill.folderId || !selectedFolderIds.has(skill.folderId))) return false;
       if (categories.size > 0 && !skill.categories.some((category) => categories.has(categoryLookupKey(category)))) return false;
       if (q) {
         const haystack = [
@@ -3032,7 +3224,7 @@ export function companySkillService(db: Db) {
       .from(companySkills)
       .where(and(eq(companySkills.companyId, companyId), eq(companySkills.id, id)))
       .then((rows) => rows[0] ?? null);
-    return row ? toCompanySkill(row) : null;
+    return row ? enrichFolderPath(companyId, toCompanySkill(row)) : null;
   }
 
   async function getByKey(companyId: string, key: string) {
@@ -3041,7 +3233,7 @@ export function companySkillService(db: Db) {
       .from(companySkills)
       .where(and(eq(companySkills.companyId, companyId), eq(companySkills.key, key)))
       .then((rows) => rows[0] ?? null);
-    return row ? toCompanySkill(row) : null;
+    return row ? enrichFolderPath(companyId, toCompanySkill(row)) : null;
   }
 
   async function getBySlugIfUnique(companyId: string, slug: string) {
@@ -3049,7 +3241,13 @@ export function companySkillService(db: Db) {
       .select(selectCompanySkillColumns())
       .from(companySkills)
       .where(and(eq(companySkills.companyId, companyId), eq(companySkills.slug, slug)));
-    return rows.length === 1 ? toCompanySkill(rows[0]!) : null;
+    return rows.length === 1 ? enrichFolderPath(companyId, toCompanySkill(rows[0]!)) : null;
+  }
+
+  async function enrichFolderPath(companyId: string, skill: CompanySkill): Promise<CompanySkill> {
+    if (!skill.folderId) return { ...skill, folderPath: null };
+    const folder = await folderSvc.getFolder(companyId, skill.folderId);
+    return { ...skill, folderPath: folder?.kind === "skill" ? folder.path : null };
   }
 
   async function getByRouteRef(companyId: string, ref: string) {
@@ -3257,11 +3455,14 @@ export function companySkillService(db: Db) {
     skillId: string,
     input: CompanySkillVersionCreateRequest = {},
     actor: SkillActor | null = null,
+    options: CreateVersionOptions = {},
   ): Promise<CompanySkillVersion> {
-    await ensureSkillInventoryCurrent(companyId);
-    const skill = await getById(companyId, skillId);
+    if (!options.skipInventoryRefresh) await ensureSkillInventoryCurrent(companyId);
+    const skill = options.skill ?? await getById(companyId, skillId);
     if (!skill) throw notFound("Skill not found");
-    const fileInventory = serializeVersionFileInventory(await collectVersionFileInventory(companyId, skill));
+    const fileInventory = serializeVersionFileInventory(
+      options.fileInventory ?? await collectVersionFileInventory(companyId, skill),
+    );
     const versionRow = await db.transaction(async (tx) => {
       await tx.execute(sql`
         select ${companySkills.id}
@@ -3283,6 +3484,9 @@ export function companySkillService(db: Db) {
           companySkillId: skillId,
           revisionNumber: Number(nextRevision ?? 1),
           label: input.label?.trim() || null,
+          releaseId: options.release?.id ?? null,
+          releaseName: options.release?.name ?? null,
+          releasedAt: options.release?.releasedAt ?? null,
           fileInventory,
           authorAgentId: actor?.type === "agent" ? actor.agentId ?? null : null,
           authorUserId: actor?.type === "user" ? actor.userId ?? null : null,
@@ -3290,10 +3494,12 @@ export function companySkillService(db: Db) {
         .returning()
         .then((rows) => rows[0] ?? null);
       if (!row) return null;
-      await tx
-        .update(companySkills)
-        .set({ currentVersionId: row.id, updatedAt: new Date() })
-        .where(and(eq(companySkills.id, skillId), eq(companySkills.companyId, companyId)));
+      if (options.updateCurrentVersion !== false) {
+        await tx
+          .update(companySkills)
+          .set({ currentVersionId: row.id, updatedAt: new Date() })
+          .where(and(eq(companySkills.id, skillId), eq(companySkills.companyId, companyId)));
+      }
       return row;
     });
     if (!versionRow) throw notFound("Failed to persist skill version");
@@ -3927,6 +4133,7 @@ export function companySkillService(db: Db) {
     input: CompanySkillCreateRequest,
     actor: SkillActor | null = null,
   ): Promise<CompanySkill> {
+    if (input.folderId) await folderSvc.validateSkillFolder(companyId, input.folderId);
     const slug = normalizeSkillSlug(input.slug ?? input.name) ?? "skill";
     const key = `company/${companyId}/${slug}`;
     const existing = await getByKey(companyId, key);
@@ -4013,6 +4220,7 @@ export function companySkillService(db: Db) {
         authorName: normalizeStoreText(input.authorName, 200) ?? forkSource?.authorName ?? created.authorName,
         homepageUrl: normalizeStoreText(input.homepageUrl, 2000) ?? forkSource?.homepageUrl ?? created.homepageUrl,
         categories: input.categories ? normalizeCategoryList(input.categories) : forkSource?.categories ?? created.categories,
+        folderId: input.folderId ?? null,
         sharingScope,
         forkedFromSkillId: forkSource?.id ?? null,
         forkedFromCompanyId: forkSource?.companyId ?? null,
@@ -4557,6 +4765,15 @@ export function companySkillService(db: Db) {
             existingSkillId: existingBySource.id,
             reason: "This skill is already installed from the same path.",
           });
+          if (mode === "preview" || !selected) continue;
+          const persisted = (await upsertImportedSkills(companyId, [{
+            ...nextSkill,
+            key: existingBySource.key,
+            slug: existingBySource.slug,
+          }]))[0];
+          if (!persisted) continue;
+          updated.push(persisted);
+          upsertAcceptedSkill(persisted);
           continue;
         }
 
@@ -5050,6 +5267,10 @@ export function companySkillService(db: Db) {
     }
     const markdown = await fs.readFile(path.join(originSnapshotLocator, catalogSkill.entrypoint), "utf8");
     const metadata = buildCatalogSkillMetadata(catalogSkill, existingByKey, originSnapshotLocator);
+    const bundledCategory = paperclipBundledFolderCategory(catalogSkill.key, metadata);
+    const bundledFolder = bundledCategory
+      ? await folderSvc.ensureBundledCategory(companyId, bundledFolderLabel(bundledCategory))
+      : null;
     const parsed = parseFrontmatterMarkdown(markdown);
     const storeMetadata = readSkillStoreMetadata(parsed.frontmatter, {
       ...metadata,
@@ -5057,6 +5278,7 @@ export function companySkillService(db: Db) {
     });
     const values = {
       companyId,
+      folderId: bundledFolder?.id ?? existingByKey?.folderId ?? null,
       key: catalogSkill.key,
       slug,
       name: catalogSkill.name,
@@ -5446,8 +5668,18 @@ export function companySkillService(db: Db) {
       };
       const parsed = parseFrontmatterMarkdown(skill.markdown);
       const storeMetadata = readSkillStoreMetadata(parsed.frontmatter, metadata);
+      const bundledCategory = paperclipBundledFolderCategory(skill.key, incomingMeta);
+      const bundledFolder = bundledCategory
+        ? await folderSvc.ensureBundledCategory(companyId, bundledFolderLabel(bundledCategory))
+        : null;
+      const projectId = asString(incomingMeta.projectId);
+      const projectName = asString(incomingMeta.projectName);
+      const projectFolder = !existing && incomingKind === "project_scan" && projectId && projectName
+        ? await folderSvc.ensureProjectFolder(companyId, projectId, projectName)
+        : null;
       const values: ImportedSkillPersistValues = {
         companyId,
+        folderId: bundledFolder?.id ?? projectFolder?.id ?? existing?.folderId ?? null,
         key: skill.key,
         slug: skill.slug,
         name: skill.name,

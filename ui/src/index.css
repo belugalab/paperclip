@@ -182,6 +182,17 @@
   --status-task-icon-blocked: var(--status-task-blocked);         /* #dc2626 both modes */
   --status-task-icon-cancelled: #52585d;
   --status-task-icon-in_queue: var(--status-task-in_progress);    /* blocked shape, blue */
+
+  --folder-color-indigo: #6366f1;
+  --folder-color-violet: #8b5cf6;
+  --folder-color-emerald: #10b981;
+  --folder-color-cyan: #06b6d4;
+  --folder-color-amber: #f59e0b;
+  --folder-color-slate: #64748b;
+  --gtc-folder-row: 1rem minmax(0, 1fr) auto;
+  --gtc-folder-row-actions: 1rem minmax(0, 1fr) auto auto;
+  --sz-folder-rail: 13.25rem;
+  --sz-folder-sheet-max: 80dvh;
 }
 
 .dark {
@@ -1562,6 +1573,7 @@ span.paperclip-mention-chip[data-mention-kind="external-object"] {
   --sz-calc-1: calc(100% - 1.5rem); /* Extracted from ui/src/components/ActivityFeed.tsx (w-[calc(100%-1.5rem)]). */
   --sz-calc-2: calc(100% - 0.75rem); /* Extracted from ui/src/components/ActivityFeed.tsx (w-[calc(100%-0.75rem)]). */
   --sz-16rem: 16rem; /* Extracted from ui/src/components/ActivityFeed.tsx (max-w-[16rem]). */
+  --sz-20rem: 20rem; /* AgentSkillReleasePicker.tsx release menu width cap. */
   --sz-18px: 18px; /* Extracted from ui/src/components/ActivityFeed.tsx (p-[18px]). */
   --sz-44px: 44px; /* Extracted from ui/src/components/AgentConfigForm.tsx (min-h-[44px]). */
   --sz-88px: 88px; /* Extracted from ui/src/components/AgentConfigForm.tsx (min-h-[88px]). */
@@ -1824,6 +1836,7 @@ span.paperclip-mention-chip[data-mention-kind="external-object"] {
   --gtc-62: 1fr minmax(0,18rem);
   --gtc-63: 280px 1fr;
   --gtc-64: minmax(0,20rem) 1fr;
+  --gtc-65: minmax(8rem,0.38fr) minmax(0,0.62fr) auto;
   --gtr-1: auto auto; /* Extracted from ui/src/components/ui/card.tsx (grid-rows-[auto_auto]). */
   --gtr-2: 1fr; /* Extracted from ui/src/pages/CompanySkills.tsx (grid-rows-[1fr]). */
   --gtr-3: 0fr; /* Extracted from ui/src/pages/CompanySkills.tsx (grid-rows-[0fr]). */

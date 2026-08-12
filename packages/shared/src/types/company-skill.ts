@@ -34,6 +34,8 @@ export interface CompanySkillVersionFileInventoryEntry extends CompanySkillFileI
 export interface CompanySkill {
   id: string;
   companyId: string;
+  folderId?: string | null;
+  folderPath?: string | null;
   key: string;
   slug: string;
   name: string;
@@ -67,6 +69,8 @@ export interface CompanySkill {
 export interface CompanySkillListItem {
   id: string;
   companyId: string;
+  folderId?: string | null;
+  folderPath?: string | null;
   key: string;
   slug: string;
   name: string;
@@ -140,6 +144,8 @@ export interface CompanySkillListQuery {
   categories?: string[];
   scope?: CompanySkillSharingScope;
   include?: CompanySkillListInclude[];
+  folderId?: string;
+  includeSubtree?: boolean;
 }
 
 export interface CompanySkillCategoryCount {
@@ -153,6 +159,9 @@ export interface CompanySkillVersion {
   companySkillId: string;
   revisionNumber: number;
   label: string | null;
+  releaseId: string | null;
+  releaseName: string | null;
+  releasedAt: Date | null;
   fileInventory: CompanySkillVersionFileInventoryEntry[];
   authorAgentId: string | null;
   authorUserId: string | null;
@@ -374,6 +383,7 @@ export interface CompanySkillProjectScanResult {
 }
 
 export interface CompanySkillCreateRequest {
+  folderId?: string | null;
   name: string;
   slug?: string | null;
   description?: string | null;
