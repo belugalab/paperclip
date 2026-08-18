@@ -78,6 +78,15 @@ function resolveOpenCodeBiller(env: Record<string, string>, provider: string | n
   return inferOpenAiCompatibleBiller(env, null) ?? provider ?? "unknown";
 }
 
+function resolveOpenCodeBillingType(
+  env: Record<string, string | undefined>,
+  provider: string,
+): "api" | "subscription" {
+  if (provider === "anthropic" && !env.ANTHROPIC_API_KEY) return "subscription";
+  if (provider === "openai" && !env.OPENAI_API_KEY) return "subscription";
+  return "api";
+}
+
 const REMOTE_OPENCODE_MODELS_PROBE_DEFAULT_TIMEOUT_SEC = 20;
 const REMOTE_OPENCODE_MODELS_PROBE_SANDBOX_TIMEOUT_SEC = 120;
 
@@ -688,7 +697,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         provider: parseModelProvider(modelId),
         biller: resolveOpenCodeBiller(runtimeEnv, parseModelProvider(modelId)),
         model: modelId,
-        billingType: "unknown",
+        billingType: resolveOpenCodeBillingType(runtimeEnv, parseModelProvider(modelId) ?? ""),
         costUsd: attempt.parsed.costUsd,
         resultJson: {
           stdout: attempt.proc.stdout,
