@@ -140,6 +140,15 @@ function resolvePiBiller(env: Record<string, string>, provider: string | null): 
   return inferOpenAiCompatibleBiller(env, null) ?? provider ?? "unknown";
 }
 
+function resolvePiBillingType(
+  env: Record<string, string | undefined>,
+  provider: string,
+): "api" | "subscription" {
+  if (provider === "anthropic" && !env.ANTHROPIC_API_KEY) return "subscription";
+  if (provider === "openai" && !env.OPENAI_API_KEY) return "subscription";
+  return "api";
+}
+
 async function ensureSessionsDir(): Promise<string> {
   await fs.mkdir(PAPERCLIP_SESSIONS_DIR, { recursive: true });
   return PAPERCLIP_SESSIONS_DIR;
@@ -795,7 +804,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         provider: provider,
         biller: resolvePiBiller(runtimeEnv, provider),
         model: model,
-        billingType: "unknown",
+        billingType: resolvePiBillingType(runtimeEnv, provider ?? ""),
         costUsd: attempt.parsed.usage.costUsd,
         resultJson: {
           stdout: attempt.proc.stdout,
