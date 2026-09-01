@@ -1737,7 +1737,8 @@ async function materializeManagedProjectWorkspace(
     const reason = error instanceof Error ? error.message : String(error);
     const authNote = describeGitAuthFailure({
       error: reason,
-      used: auth ? { source: auth.source, secretName: auth.secretName } : null,
+      used: auth ? { source: auth.source, secretName: auth.secretName, providerId: auth.providerId } : null,
+      remoteUrl: input.repoUrl,
     });
     throw new Error(scrubGitCredentialText(
       `Failed to prepare managed checkout for "${input.repoUrl}" at "${cwd}": ${reason}${authNote ? ` ${authNote}` : ""}`,
