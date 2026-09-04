@@ -42,6 +42,7 @@ services:
       BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set}"
       # Independent secret for signed approval-gated tool actions.
       PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: "${PAPERCLIP_TOOL_ACTION_SIGNING_SECRET:-}"
+      PAPERCLIP_GITLAB_HOSTS: "${PAPERCLIP_GITLAB_HOSTS}"
     volumes:
       - paperclip-data:/paperclip
     depends_on:
