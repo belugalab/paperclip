@@ -19,6 +19,15 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
+    # No `init: true` here on purpose. The image makes tini PID 1 itself
+    # (Dockerfile ENTRYPOINT), which covers every launch path -- compose, plain
+    # `docker run`, the quadlet units and the ECS task definition -- instead of
+    # one lever per orchestrator. Setting it here too would nest docker-init
+    # around tini and make tini warn that it is not PID 1 on every boot.
+    # pids_limit is the backstop: if something ever does leak processes again,
+    # this container hits its own ceiling and dies visibly rather than starving
+    # the whole host of pids.
+    pids_limit: 2048
     ports:
       - "3100:3100"
     environment:
@@ -29,8 +38,18 @@ services:
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "private"
       PAPERCLIP_PUBLIC_URL: "${PAPERCLIP_PUBLIC_URL:-http://localhost:3100}"
       BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set}"
+      PAPERCLIP_GITLAB_HOSTS: "${PAPERCLIP_GITLAB_HOSTS}"
+      # Points at a PEM CA bundle for a self-hosted GitLab instance on a private/internal CA.
+      # Drop the bundle file into ./certs (mounted read-only below) and set this to its
+      # in-container path, e.g. PAPERCLIP_GITLAB_CA_CERT_PATH=/certs/lab-ca.pem.
+      PAPERCLIP_GITLAB_CA_CERT_PATH: "${PAPERCLIP_GITLAB_CA_CERT_PATH}"
     volumes:
       - paperclip-data:/paperclip
+      # Deliberately NOT under /paperclip: scripts/docker-entrypoint.sh recursively
+      # chowns the whole $PAPERCLIP_HOME tree to the node user before dropping
+      # privileges, and that chown fails outright on a read-only mount, so a cert
+      # mounted at e.g. /paperclip/ca would crash the container on every boot.
+      - ./certs:/certs:ro
     depends_on:
       db:
         condition: service_healthy

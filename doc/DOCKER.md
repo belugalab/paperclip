@@ -133,6 +133,34 @@ Granular overrides remain available if needed (`PAPERCLIP_AUTH_PUBLIC_BASE_URL`,
 
 Set `PAPERCLIP_ALLOWED_HOSTNAMES` explicitly only when you need additional hostnames beyond the public URL host (for example Tailscale/LAN aliases or multiple private hostnames).
 
+### Optional Vercel Connect credentials
+
+Vercel Connect's backend integration is retained for controlled testing and
+existing Vercel-backed connections, but its new-connection UI is currently
+withheld from **Apps → Browse**. Setting
+`PAPERCLIP_VERCEL_CONNECT_ENABLED=true` does not expose a customer-facing setup
+entry. Native provider setup screens remain unchanged. Vercel-hosted deployments use the
+workload OIDC token Vercel injects. Other hosted and self-hosted deployments
+can provide `PAPERCLIP_VERCEL_CONNECT_ACCESS_TOKEN` as a deployment bootstrap
+secret only when that token type is accepted by the live Connect API:
+
+```yaml
+services:
+  paperclip:
+    environment:
+      PAPERCLIP_VERCEL_CONNECT_ENABLED: "true"
+      PAPERCLIP_VERCEL_CONNECT_ACCESS_TOKEN: ${PAPERCLIP_VERCEL_CONNECT_ACCESS_TOKEN}
+```
+
+Do not save that access token in a company secret or connection config. It is
+instance bootstrap authority for the operator-selected Vercel account. A token's
+long expiry and broad Vercel scope do not prove Connect compatibility; validate
+it with connector metadata before rollout. Workload OIDC takes precedence when
+both authorities are present. Turning the feature flag off hides new
+Vercel-backed setup; existing connections keep resolving while workload OIDC or
+the bootstrap token remains available. Missing or invalid authority fails
+closed. See the [Vercel Connect operator guide](./connections/VERCEL-CONNECT.md).
+
 ## Claude + Codex Local Adapters in Docker
 
 The image pre-installs:
@@ -199,12 +227,21 @@ The `docker/quadlet/` directory contains unit files to run Paperclip + PostgreSQ
    EOL
    ```
 
-4. Create the data directory and start:
+4. Create the data and certs directories, then start. The certs directory backs the unit's
+   `/certs` bind mount and must exist even if you don't use self-hosted GitLab:
 
    ```sh
-   mkdir -p ~/.local/share/paperclip
+   mkdir -p ~/.local/share/paperclip ~/.config/containers/systemd/paperclip-certs
    systemctl --user daemon-reload
    systemctl --user start paperclip-pod
+   ```
+
+   For self-hosted GitLab on a private/internal CA, drop the PEM bundle into that certs
+   directory and set `PAPERCLIP_GITLAB_HOSTS`/`PAPERCLIP_GITLAB_CA_CERT_PATH` in
+   `paperclip.env` (see `docker/certs/README.md`):
+
+   ```sh
+   cp /path/to/lab-ca.pem ~/.config/containers/systemd/paperclip-certs/
    ```
 
 ### Quadlet management
@@ -259,61 +296,9 @@ Notes:
 - In authenticated mode, the smoke script defaults `SMOKE_AUTO_BOOTSTRAP=true` and drives the real bootstrap path automatically: it signs up a real user, runs `paperclipai auth bootstrap-ceo` inside the container to mint a real bootstrap invite, accepts that invite over HTTP, and verifies board session access.
 - Run the script in the foreground to watch the onboarding flow; stop with `Ctrl+C` after validation.
 - Set `SMOKE_DETACH=true` to leave the container running for automation and optionally write shell-ready metadata to `SMOKE_METADATA_FILE`.
+- Set `SMOKE_CONTAINER_NAME` to fix the container's name up front. Automation that has to collect diagnostics when the script *fails* needs a name it already knows, rather than one it can only read back out of a successful run. Defaults to the image name.
+- The container's logs are dumped to `SMOKE_LOG_FILE` (default `$TMPDIR/<container name>.log`) before the script tears the container down, so a run that never became ready still leaves its logs behind.
 - The image definition is in `docker/Dockerfile.onboard-smoke`.
-
-## OmniRoute Integration (LLM Gateway)
-
-When running Paperclip alongside [OmniRoute](https://github.com/belugalab/omniroute) as an LLM gateway, configure agents to use `omniroute/` prefixed model IDs (e.g. `omniroute/auto/best-free`).
-
-### Environment
-
-```sh
-OPENROUTER_BASE_URL=http://omniroute-prod:20129/v1
-OPENROUTER_API_KEY=sk-...
-PAPERCLIP_OPENCODE_SMALL_MODEL=omniroute/auto/fast
-```
-
-The `opencode_local` adapter auto-generates an OpenCode provider config by fetching the model catalog from `${OPENROUTER_BASE_URL}/models`. No static `PAPERCLIP_OPENCODE_PROVIDERS` JSON is needed.
-
-### Model Selection Notes
-
-- **Use `auto/best-free`** as the default model for agents. All `auto/*` combos in OmniRoute route to the same upstream backend (`big-pickle` via `oc` provider), so there is no functional difference between them — `auto/best-free` is simply the most tested and reliable alias.
-- **Avoid `auto/fast` and other `pro-*` / `*:pro` combos** — these can return empty responses (0 tokens) intermittently when the upstream is overloaded. This manifests as runs completing in ~3s with no work done.
-- `PAPERCLIP_OPENCODE_SMALL_MODEL` controls the title/helper model and can safely use any `auto/*` alias (title generation is a single-shot call that tolerates transient failures).
-- Agent model is set in the agent's `adapterConfig.model` field via the API or UI.
-- **Note:** `auto/best-free`, `auto/best-chat`, `auto/best-fast`, `auto/chat`, `auto/fast`, `auto/coding`, `auto/reasoning` all route to the same `big-pickle` model. The names describe combo routing intent, but currently resolve identically.
-
-### Docker Compose (shared network)
-
-```yaml
-# paperclip compose.yml
-services:
-  server:
-    env_file: .env
-    networks:
-      - omniroute
-      - internal
-
-networks:
-  omniroute:
-    external: true
-    name: omniroute
-  internal:
-    internal: true
-```
-
-```yaml
-# omniroute compose.yml
-services:
-  omniroute-prod:
-    # ...
-    networks:
-      - omniroute
-
-networks:
-  omniroute:
-    name: omniroute
-```
 
 ## General Notes
 
