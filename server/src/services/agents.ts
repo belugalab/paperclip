@@ -18,6 +18,7 @@ import {
 } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
+  agentRuntimeConfigSchema,
   getAgentWorkEligibility,
   isUuidLike,
   normalizeAgentApiKeyScope,
@@ -25,8 +26,16 @@ import {
   type AgentEligibilityAgent,
   type AgentApiKeyScope,
 } from "@paperclipai/shared";
+import {
+  normalizePaperclipRunnerAdapterConfig,
+} from "@paperclipai/adapter-utils/server-utils";
 import { conflict, notFound, unprocessable } from "../errors.js";
-import { syncAgentAdapterEnvBindings } from "./agent-secret-bindings.js";
+import {
+  collectSecretRefs,
+  collectUserSecretRefs,
+  syncAgentAdapterEnvBindings,
+} from "./agent-secret-bindings.js";
+import { logActivity } from "./activity-log.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
 import {
@@ -253,6 +262,12 @@ function configPatchFromSnapshot(snapshot: unknown): Partial<typeof agents.$infe
   if (typeof snapshot.budgetMonthlyCents !== "number" || !Number.isFinite(snapshot.budgetMonthlyCents)) {
     throw unprocessable("Invalid revision snapshot: budgetMonthlyCents");
   }
+  const runtimeConfig = agentRuntimeConfigSchema.safeParse(
+    isPlainRecord(snapshot.runtimeConfig) ? snapshot.runtimeConfig : {},
+  );
+  if (!runtimeConfig.success) {
+    throw unprocessable("Invalid revision snapshot: runtimeConfig");
+  }
 
   return {
     name: snapshot.name,
@@ -266,7 +281,7 @@ function configPatchFromSnapshot(snapshot: unknown): Partial<typeof agents.$infe
         : null,
     adapterType: snapshot.adapterType,
     adapterConfig: isPlainRecord(snapshot.adapterConfig) ? snapshot.adapterConfig : {},
-    runtimeConfig: isPlainRecord(snapshot.runtimeConfig) ? snapshot.runtimeConfig : {},
+    runtimeConfig: runtimeConfig.data,
     defaultEnvironmentId:
       typeof snapshot.defaultEnvironmentId === "string" || snapshot.defaultEnvironmentId === null
         ? snapshot.defaultEnvironmentId
@@ -329,7 +344,7 @@ export function agentService(db: Db) {
   function normalizeAgentBaseRow(row: typeof agents.$inferSelect) {
     return withUrlKey({
       ...row,
-      permissions: normalizeAgentPermissions(row.permissions, row.role),
+      permissions: normalizeAgentPermissions(row.permissions),
     });
   }
 
@@ -466,6 +481,8 @@ export function agentService(db: Db) {
   async function syncAgentSecretBindings(
     agent: { id: string; companyId: string; adapterConfig: unknown },
     dbClient: Db = db,
+    previousAdapterConfig: unknown = null,
+    actor: RevisionMetadata = {},
   ) {
     const scopedSecretsSvc = dbClient === db ? secretsSvc : secretService(dbClient);
     await syncAgentAdapterEnvBindings({
@@ -474,6 +491,47 @@ export function agentService(db: Db) {
       agentId: agent.id,
       adapterConfig: agent.adapterConfig,
     });
+    const previousRefs = new Set([
+      ...collectSecretRefs(previousAdapterConfig).map((ref) => `secret:${ref.secretId}:${ref.configPath}`),
+      ...collectUserSecretRefs(previousAdapterConfig).map((ref) => `user:${ref.definitionKey}:${ref.configPath}`),
+    ]);
+    const createdRefs = [
+      ...collectSecretRefs(agent.adapterConfig).map((ref) => ({
+        key: `secret:${ref.secretId}:${ref.configPath}`,
+        configPath: ref.configPath,
+        bindingType: "secret_ref",
+        secretId: ref.secretId,
+        definitionKey: null,
+      })),
+      ...collectUserSecretRefs(agent.adapterConfig).map((ref) => ({
+        key: `user:${ref.definitionKey}:${ref.configPath}`,
+        configPath: ref.configPath,
+        bindingType: "user_secret_ref",
+        secretId: null,
+        definitionKey: ref.definitionKey,
+      })),
+    ].filter((ref) => !previousRefs.has(ref.key));
+    const actorType = actor.createdByUserId ? "user" as const : actor.createdByAgentId ? "agent" as const : "system" as const;
+    const actorId = actor.createdByUserId ?? actor.createdByAgentId ?? "system";
+    for (const ref of createdRefs) {
+      await logActivity(dbClient, {
+        companyId: agent.companyId,
+        actorType,
+        actorId,
+        agentId: actor.createdByAgentId ?? null,
+        action: "secret.binding.created",
+        entityType: "agent",
+        entityId: agent.id,
+        details: {
+          targetType: "agent",
+          targetId: agent.id,
+          configPath: ref.configPath,
+          bindingType: ref.bindingType,
+          secretId: ref.secretId,
+          definitionKey: ref.definitionKey,
+        },
+      });
+    }
   }
 
   /**
@@ -538,7 +596,6 @@ export function agentService(db: Db) {
           companyId: input.companyId,
           ownerUserId: ownerUserId ?? "",
           adapterType: CLAUDE_LOCAL_ADAPTER_TYPE,
-          environmentId: input.environmentId ?? "",
         });
         if (!consumed) {
           throw claudeOAuthClaimRejectedError();
@@ -619,17 +676,28 @@ export function agentService(db: Db) {
 
     const normalizedPatch = { ...data } as Partial<typeof agents.$inferInsert>;
     if (data.permissions !== undefined) {
-      const role = (data.role ?? existing.role) as string;
-      normalizedPatch.permissions = normalizeAgentPermissions(data.permissions, role);
+      normalizedPatch.permissions = normalizeAgentPermissions(data.permissions);
     }
     if (
       Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig") &&
       isPlainRecord(normalizedPatch.adapterConfig)
     ) {
-      normalizedPatch.adapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
+      const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
         existing.companyId,
         normalizedPatch.adapterConfig,
         { adapterType: (normalizedPatch.adapterType ?? existing.adapterType) as string },
+      );
+      normalizedPatch.adapterConfig = normalizePaperclipRunnerAdapterConfig(
+        (normalizedPatch.adapterType ?? existing.adapterType) as string,
+        normalizedAdapterConfig,
+      );
+    } else if (
+      Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterType")
+      && isPlainRecord(existing.adapterConfig)
+    ) {
+      normalizedPatch.adapterConfig = normalizePaperclipRunnerAdapterConfig(
+        normalizedPatch.adapterType as string,
+        existing.adapterConfig,
       );
     }
     // Run the server-enforced binding invariant when the patch touches the
@@ -657,6 +725,18 @@ export function agentService(db: Db) {
         .then((rows) => rows[0] ?? null);
       if (!updated) return null;
 
+      const priorAdapterConfig = isPlainRecord(existing.adapterConfig) ? existing.adapterConfig : {};
+      const afterConfig = isPlainRecord(updated.adapterConfig) ? updated.adapterConfig : {};
+      const changedExecution = updated.adapterType !== existing.adapterType
+        || (updated.adapterType === "paperclip_runner" && ["provider", "acpxAgent", "model"].some(
+          (key) => priorAdapterConfig[key] !== afterConfig[key],
+        ));
+      if (changedExecution) {
+        await txDb.delete(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, existing.companyId), eq(agentTaskSessions.agentId, id)));
+        await txDb.update(agentRuntimeState).set({ adapterType: updated.adapterType, sessionId: null, stateJson: {}, updatedAt: new Date() })
+          .where(and(eq(agentRuntimeState.companyId, existing.companyId), eq(agentRuntimeState.agentId, id)));
+      }
+
       if (Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig")) {
         if (bindingDecision) {
           await enforceClaudeOAuthBindingClaim(txDb, {
@@ -667,7 +747,12 @@ export function agentService(db: Db) {
             claudeLogin: options?.claudeLogin,
           });
         }
-        await syncAgentSecretBindings(updated, txDb);
+        await syncAgentSecretBindings(
+          updated,
+          txDb,
+          existing.adapterConfig,
+          options?.recordRevision,
+        );
       }
 
       const normalizedUpdated = await agentService(txDb).getById(updated.id);
@@ -732,12 +817,13 @@ export function agentService(db: Db) {
       const uniqueName = deduplicateAgentName(data.name, existingAgents);
 
       const role = data.role ?? "general";
-      const normalizedPermissions = normalizeAgentPermissions(data.permissions, role);
+      const normalizedPermissions = normalizeAgentPermissions(data.permissions, { context: "create" });
       const runtimeConfig = normalizeRuntimeConfigForNewAgent(data.runtimeConfig);
       const adapterType = data.adapterType ?? "process";
-      const adapterConfig = isPlainRecord(data.adapterConfig)
+      const rawAdapterConfig = isPlainRecord(data.adapterConfig)
         ? await secretsSvc.normalizeAdapterConfigForPersistence(companyId, data.adapterConfig, { adapterType })
         : {};
+      const adapterConfig = normalizePaperclipRunnerAdapterConfig(adapterType, rawAdapterConfig);
       // Run the server-enforced binding invariant after generic normalization
       // and before any database write. A create has no prior config.
       const bindingDecision = assertClaudeOAuthBindingInvariant({
@@ -938,10 +1024,14 @@ export function agentService(db: Db) {
           Object.prototype.hasOwnProperty.call(patch, "adapterConfig") &&
           isPlainRecord(patch.adapterConfig)
         ) {
-          patch.adapterConfig = await secretService(txDb).normalizeAdapterConfigForPersistence(
+          const normalizedAdapterConfig = await secretService(txDb).normalizeAdapterConfigForPersistence(
             existing.companyId,
             patch.adapterConfig,
             { adapterType: (patch.adapterType ?? existing.adapterType) as string },
+          );
+          patch.adapterConfig = normalizePaperclipRunnerAdapterConfig(
+            (patch.adapterType ?? existing.adapterType) as string,
+            normalizedAdapterConfig,
           );
           // The approval activation keeps an existing fixed binding but rejects a
           // newly introduced binding, because it carries no stored-session claim.
@@ -950,12 +1040,19 @@ export function agentService(db: Db) {
             nextConfig: patch.adapterConfig,
             priorConfig: existing.adapterConfig,
           });
+        } else if (
+          Object.prototype.hasOwnProperty.call(patch, "adapterType")
+          && isPlainRecord(existing.adapterConfig)
+        ) {
+          patch.adapterConfig = normalizePaperclipRunnerAdapterConfig(
+            patch.adapterType as string,
+            existing.adapterConfig,
+          );
         }
         if (patch.permissions !== undefined) {
-          patch.permissions = normalizeAgentPermissions(
-            patch.permissions,
-            (patch.role ?? existing.role) as string,
-          );
+          // The pending-approval activation replays the original hire
+          // request, so the new-agent creation default applies.
+          patch.permissions = normalizeAgentPermissions(patch.permissions, { context: "create" });
         }
         const updated = await tx
           .update(agents)
@@ -972,7 +1069,7 @@ export function agentService(db: Db) {
             environmentId: null,
           });
         }
-        await syncAgentSecretBindings(updated, txDb);
+        await syncAgentSecretBindings(updated, txDb, existing.adapterConfig);
         const agent = await agentService(txDb).getById(updated.id);
         if (!agent) {
           throw notFound("Agent not found");
@@ -1002,7 +1099,7 @@ export function agentService(db: Db) {
       const updated = await db
         .update(agents)
         .set({
-          permissions: normalizeAgentPermissions({ ...existing.permissions, ...permissions }, existing.role),
+          permissions: normalizeAgentPermissions({ ...existing.permissions, ...permissions }),
           updatedAt: new Date(),
         })
         .where(eq(agents.id, id))

@@ -639,25 +639,10 @@ describe("refreshRemoteTrackingBaseRef git auth", () => {
       env: { GIT_TERMINAL_PROMPT: "0" },
       source: "company_secret",
       secretName: "GH_TOKEN",
-      providerLabel: "GitHub",
     }));
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain("Could not refresh base ref origin/master");
     expect(warnings[0]).toContain("the GH_TOKEN company-secret GitHub credential");
-  });
-
-  it("attributes a failed authenticated fetch to a GitLab credential when that provider was used", async () => {
-    const { repoRoot } = await createClonedRepoWithRemote();
-    await runGit(repoRoot, ["remote", "set-url", "origin", path.join(os.tmpdir(), "paperclip-missing-remote", "repo.git")]);
-    const warnings = await refreshRemoteTrackingBaseRef(repoRoot, "origin/master", async () => ({
-      configArgs: [],
-      env: { GIT_TERMINAL_PROMPT: "0" },
-      source: "company_secret",
-      secretName: "GITLAB_TOKEN",
-      providerLabel: "GitLab",
-    }));
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toContain("the GITLAB_TOKEN company-secret GitLab credential");
   });
 
   it("keeps the unauthenticated failure warning credential-free without a provider", async () => {
@@ -7752,7 +7737,13 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     const reservePort = async () => {
       for (let attempt = 0; attempt < 100; attempt += 1) {
         const probe = net.createServer();
-        await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+        // macOS can allocate an entire ephemeral range above 55535. Pick a
+        // bounded candidate so the test's HMR companion remains a valid port.
+        await new Promise<void>((resolve) => {
+          probe.once("error", () => resolve());
+          probe.listen(20_000 + Math.floor(Math.random() * 20_000), "127.0.0.1", resolve);
+        });
+        if (!probe.listening) continue;
         const address = probe.address();
         const port = typeof address === "object" && address ? address.port : null;
         await new Promise<void>((resolve, reject) => {
@@ -8093,7 +8084,13 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     const reservePort = async () => {
       for (let attempt = 0; attempt < 100; attempt += 1) {
         const probe = net.createServer();
-        await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+        // macOS can allocate an entire ephemeral range above 55535. Pick a
+        // bounded candidate so the test's HMR companion remains a valid port.
+        await new Promise<void>((resolve) => {
+          probe.once("error", () => resolve());
+          probe.listen(20_000 + Math.floor(Math.random() * 20_000), "127.0.0.1", resolve);
+        });
+        if (!probe.listening) continue;
         const address = probe.address();
         const candidate = typeof address === "object" && address ? address.port : null;
         await new Promise<void>((resolve, reject) => {

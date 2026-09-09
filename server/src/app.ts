@@ -1,3 +1,4 @@
+import { toolActionDeliveryService } from "./services/tool-action-delivery.js";
 import express, { Router, type Request as ExpressRequest } from "express";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import path from "node:path";
@@ -19,6 +20,7 @@ import {
 } from "./services/company-import-transfers.js";
 import { companyTransferRunService } from "./services/company-transfer-runs.js";
 import { healthRoutes } from "./routes/health.js";
+import { cloudRuntimeIdentityMiddleware } from "./middleware/cloud-runtime-identity.js";
 import { cloudRoutes } from "./routes/cloud.js";
 import { companyRoutes } from "./routes/companies.js";
 import { companySkillRoutes } from "./routes/company-skills.js";
@@ -36,7 +38,7 @@ import {
   createProductionSetupTokenSandboxProvider,
   createProductionSetupTokenCleanupStore,
   createSetupTokenSecretWriter,
-  createWorkerBoundSetupTokenPtyOpener,
+  createWorkerBoundLoginPtyOpener,
 } from "./services/setup-token-transport-binding.js";
 import { environmentService } from "./services/environments.js";
 import { environmentRuntimeService } from "./services/environment-runtime.js";
@@ -70,6 +72,7 @@ import { sidebarPreferenceRoutes } from "./routes/sidebar-preferences.js";
 import { resourceMembershipRoutes } from "./routes/resource-memberships.js";
 import { inboxDismissalRoutes } from "./routes/inbox-dismissals.js";
 import { instanceSettingsRoutes } from "./routes/instance-settings.js";
+import { instanceSettingsService } from "./services/instance-settings.js";
 import { openApiRoutes } from "./routes/openapi.js";
 import {
   instanceDatabaseBackupRoutes,
@@ -81,9 +84,16 @@ import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "./routes/tool-gateway.js";
+import {
+  connectionIntentBoardRoutes,
+  runtimeConnectionIntentRoutes,
+} from "./routes/connection-intents.js";
 import { adapterRoutes } from "./routes/adapters.js";
+import { managedAgentProfileRoutes } from "./routes/managed-agent-profiles.js";
+import { remoteAgentProfileRoutes } from "./routes/remote-agent-profiles.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
+import { staticUiCacheControl } from "./static-ui-cache.js";
 import { applyUiBranding } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
 import { DEFAULT_LOCAL_PLUGIN_DIR, pluginLoader, type PluginLoader } from "./services/plugin-loader.js";
@@ -98,6 +108,8 @@ import { createPluginJobScheduler } from "./services/plugin-job-scheduler.js";
 import { pluginJobStore } from "./services/plugin-job-store.js";
 import { createPluginToolDispatcher } from "./services/plugin-tool-dispatcher.js";
 import { createToolGatewayService } from "./services/tool-gateway.js";
+import { toolAccessService } from "./services/tool-access.js";
+import { heartbeatService } from "./services/heartbeat.js";
 import { pluginLifecycleManager } from "./services/plugin-lifecycle.js";
 import { createPluginJobCoordinator } from "./services/plugin-job-coordinator.js";
 import { buildHostServices, flushPluginLogBuffer } from "./services/plugin-host-services.js";
@@ -354,6 +366,11 @@ export async function createApp(
       bindHost: opts.bindHost,
     }),
   );
+  app.use(cloudRuntimeIdentityMiddleware(db));
+  // Connection-intent tools carry their own short-lived, run-bound bearer and
+  // must be reachable by remote adapters that intentionally do not receive an
+  // agent API key. Every request revalidates the active heartbeat row.
+  app.use(runtimeConnectionIntentRoutes(db));
   app.use(
     actorMiddleware(db, {
       deploymentMode: opts.deploymentMode,
@@ -464,7 +481,7 @@ export async function createApp(
     sandbox: createProductionSetupTokenSandboxProvider({
       environments: environmentService(db),
       environmentRuntime: environmentRuntimeService(db, { pluginWorkerManager: workerManager }),
-      openLivePtySession: createWorkerBoundSetupTokenPtyOpener({
+      openLivePtySession: createWorkerBoundLoginPtyOpener({
         workerManager,
         environments: environmentService(db),
         log: (line) => logger.info(line),
@@ -493,12 +510,10 @@ export async function createApp(
       confidentialEdgeTlsTerminated: setupTokenLoginEdgeTlsTerminated,
       setupTokenLogin: setupTokenLoginTransport,
       onSetupTokenLoginService: (service) => {
+        // Capture the service, so the graceful-shutdown hook cancels every live
+        // session and releases each lease. The standalone scheduled reaper owns
+        // the startup and interval lease cleanup now (SR-4).
         setupTokenLoginService = service;
-        // Startup reaper (SR-4): release any lease whose login session is
-        // terminal or past its deadline after a restart. The DB is ready here.
-        void service.reap().catch((err) => {
-          logger.error({ err }, "Setup-token login startup reaper failed");
-        });
       },
     }),
   );
@@ -524,6 +539,8 @@ export async function createApp(
   api.use(boardChatRoutes(db, { deploymentMode: opts.deploymentMode }));
   api.use(approvalRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(secretRoutes(db));
+  api.use(managedAgentProfileRoutes(db));
+  api.use(remoteAgentProfileRoutes(db));
   const trustedLocalStdioRuntimeHost =
     process.env.PAPERCLIP_TRUSTED_MCP_RUNTIME_HOST
     ?? process.env.PAPERCLIP_TOOL_RUNTIME_TRUSTED_HOST
@@ -559,11 +576,19 @@ export async function createApp(
     lifecycleManager: lifecycle,
     db,
   });
+  const gatewayOAuthAccess = toolAccessService(db, {
+    deploymentMode: opts.deploymentMode,
+    deploymentExposure: opts.deploymentExposure,
+    trustedLocalStdioRuntimeHost,
+  });
+  const toolActionDeliveries = toolActionDeliveryService(db, heartbeatService(db, { pluginWorkerManager: workerManager }));
   const toolGateway = createToolGatewayService(db, {
+    onToolActionSettled: (id) => toolActionDeliveries.deliver(id),
     pluginToolDispatcher: toolDispatcher,
     deploymentMode: opts.deploymentMode,
     deploymentExposure: opts.deploymentExposure,
     trustedLocalStdioRuntimeHost,
+    oauthGrantRefresher: (input) => gatewayOAuthAccess.refreshOAuthGrantCredentials(input),
   });
   // Issue routes are intentionally mounted after the gateway is constructed because
   // issue approval endpoints delegate to it. The intervening routers use distinct
@@ -572,14 +597,23 @@ export async function createApp(
     feedbackExportService: opts.feedbackExportService,
     pluginWorkerManager: workerManager,
     approveToolActionRequest: (input) => toolGateway.approveActionRequest(input),
+    declineToolActionRequest: (input) => toolGateway.declineActionRequest(input),
   }));
+  app.locals.toolGateway = toolGateway;
+  app.locals.toolActionDeliveries = toolActionDeliveries;
   app.use(mcpGatewayProtocolRoutes(toolGateway));
+  const connectionIntentHeartbeat = heartbeatService(db, {
+    pluginWorkerManager: workerManager,
+  });
   api.use(toolAccessRoutes(db, {
     deploymentMode: opts.deploymentMode,
     deploymentExposure: opts.deploymentExposure,
+    authPublicBaseUrl: opts.authPublicBaseUrl,
     trustedLocalStdioRuntimeHost,
     toolGateway,
+    connectionIntentHeartbeat,
   }));
+  api.use(connectionIntentBoardRoutes(db, connectionIntentHeartbeat));
   api.use(smokeLabRoutes(db, {
     deploymentMode: opts.deploymentMode,
     deploymentExposure: opts.deploymentExposure,
@@ -646,7 +680,10 @@ export async function createApp(
       { toolGateway },
     ),
   );
-  api.use(adapterRoutes());
+  api.use(adapterRoutes({
+    getNativeRunnerEnabled: async () =>
+      (await instanceSettingsService(db).getExperimental()).enableNativeRunner === true,
+  }));
   api.use(
     accessRoutes(db, {
       deploymentMode: opts.deploymentMode,
@@ -684,15 +721,15 @@ export async function createApp(
       );
       // Non-hashed static files (favicon.ico, manifest, robots.txt, etc.):
       // short cache so operators who swap them out see the new version
-      // reasonably fast. Override for `index.html` specifically — it is
-      // served by this middleware for `/` and `/index.html`, and it must
-      // never outlive the asset hashes it points at.
+      // reasonably fast, with must-revalidate overrides for index.html and
+      // sw.js (see staticUiCacheControl for why those two).
       app.use(
         express.static(uiDist, {
           maxAge: "1h",
           setHeaders(res, filePath) {
-            if (path.basename(filePath) === "index.html") {
-              res.set("Cache-Control", "no-cache");
+            const override = staticUiCacheControl(filePath);
+            if (override) {
+              res.set("Cache-Control", override);
             }
           },
         }),
@@ -717,6 +754,19 @@ export async function createApp(
     } else {
       console.warn("[paperclip] UI dist not found; running in API-only mode");
     }
+    if (process.env.PAPERCLIP_MANAGED_RUNTIME_EXPOSURE === "tailscale_https") {
+      // The managed-runtime supervisor waits for the app port AND its derived
+      // Vite HMR companion port to bind before publishing the service. Static
+      // mode has no Vite, so bind the same placeholder listener dev mode uses
+      // or the supervisor kills a healthy server at the readiness deadline
+      // (PAP-18043).
+      const hmrServer = createHttpServer((_req, res) => {
+        res.writeHead(426, { "Content-Type": "text/plain" });
+        res.end("Upgrade Required");
+      });
+      await listenViteHmrServer(hmrServer, resolveViteHmrPort(opts.serverPort), opts.bindHost);
+      viteHmrServer = hmrServer;
+    }
   }
 
   if (opts.uiMode === "vite-dev") {
@@ -730,9 +780,18 @@ export async function createApp(
       res.end("Upgrade Required");
     });
     const { createServer: createViteServer } = await import("vite");
+    const configuredViteCacheDir = process.env.PAPERCLIP_VITE_CACHE_DIR?.trim();
     const vite = await createViteServer({
       root: uiRoot,
+      ...(configuredViteCacheDir
+        ? { cacheDir: path.resolve(configuredViteCacheDir) }
+        : {}),
       appType: "custom",
+      // Vite otherwise discovers every HTML entry below the UI root. Generated
+      // Storybook output can reference dependencies that are intentionally not
+      // part of the application install, poisoning a clean embedded dev-server
+      // cache before the browser opens. The embedded UI has one real entry.
+      optimizeDeps: { entries: [path.resolve(uiRoot, "index.html")] },
       server: {
         // Listener binding and browser HMR hostname are deliberately separate:
         // exposed branch runtimes stay loopback-only while the browser uses the
@@ -926,7 +985,12 @@ export async function createApp(
   const shutdownAppServices = (): Promise<void> => {
     if (appServicesShutdown) return appServicesShutdown;
     appServicesShutdown = (async () => {
+      scheduler.stop();
+      jobCoordinator.stop();
       disableFeedbackExportFlushes();
+      // The scheduler tick queries the database. Stop it here, inside the
+      // awaited teardown, so no tick runs after the caller ends the pool.
+      scheduler.stop();
       if (importTransferSweepTimer) {
         clearInterval(importTransferSweepTimer);
         importTransferSweepTimer = null;

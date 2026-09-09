@@ -139,10 +139,8 @@ Human auth tables (`users`, `sessions`, and provider-specific auth artifacts) ar
 - `issue_counter` int not null
 - `budget_monthly_cents` int not null default 0
 - `spent_monthly_cents` int not null default 0
-- `attachment_max_bytes` int not null
 - `require_board_approval_for_new_agents` boolean not null default false
 - feedback sharing consent fields
-- branding fields such as `brand_color`
 
 Invariant: every business record belongs to exactly one company.
 
@@ -159,7 +157,7 @@ Invariant: every business record belongs to exactly one company.
 - `capabilities` text null
 - `adapter_type` text; built-ins include `process`, `http`, `claude_local`, `codex_local`, `gemini_local`, `opencode_local`, `pi_local`, `cursor`, `hermes_local`, `hermes_gateway`, and `openclaw_gateway`
 - `adapter_config` jsonb not null
-- `runtime_config` jsonb not null default `{}`; may include Paperclip runtime policy such as `modelProfiles.cheap.adapterConfig` for an optional low-cost model lane that does not change the primary adapter config
+- `runtime_config` jsonb not null default `{}`; contains Paperclip runtime policy such as heartbeat scheduling and debug settings
 - `default_environment_id` uuid fk `environments.id` null
 - `context_mode` enum: `thin | fat` default `thin`
 - `budget_monthly_cents` int not null default 0
@@ -218,6 +216,14 @@ Invariant:
 
 Routine execution issues add a routine-scoped env overlay after project env and before Paperclip runtime-owned keys. Routine env uses the same secret-aware binding format, is stored on `routines.env`, is snapshotted in routine revisions, and resolves secret refs against the routine binding target so routine-owned secrets do not require direct bindings on the executing agent.
 
+Project source repositories use the existing `project_workspaces` collection.
+Each selected GitHub repository has a canonical `repo_url` and stable provider ID
+in `metadata.githubRepositoryId`; the first workspace remains the execution default.
+The board can select multiple repositories from its usable personal and shared
+GitHub grants. Selection does not grant runtime credential access. Legacy workspace
+URLs remain valid. Project creation and repository replacement are transactional.
+See `doc/project-repositories.md` for the API and UI contract.
+
 ## 7.6 `issues` (core task entity)
 
 - `id` uuid pk
@@ -242,7 +248,7 @@ Routine execution issues add a routine-scoped env overlay after project env and 
 - `work_mode` text not null default `standard`; supported values:
   - `standard`: normal autonomous execution. Agents may investigate, edit files, create artifacts, and complete the task.
   - `ask`: answer-only execution. Agents may use tools for investigation or temporary scratch work, but the deliverable is an issue-thread answer; they must not write implementation code or produce an implementation plan.
-  - `planning`: plan-only execution. Agents create or revise the plan without implementation work; accepted-plan continuations remain planning-specific and create child issues from the approved plan.
+  - `planning`: plan-only execution. Agents create or revise the plan without implementation work. Accepting a fresh confirmation for the issue's current `plan` revision atomically changes this mode to `standard`, so the continuation may implement the approved plan on the source issue.
 - `billing_code` text null
 - `assignee_adapter_overrides` jsonb null
 - `execution_policy` jsonb null
@@ -260,6 +266,7 @@ Invariants:
 - `in_progress` requires assignee
 - an `in_review -> done | cancelled` verdict is authorized against the current review policy while the issue row is locked; a policy change in the same request or a concurrent request cannot relax that verdict gate
 - accepting or rejecting the review-confirmation interaction locks the issue row before resolving the interaction and reauthorizes against the current review policy in that transaction
+- accepting a fresh `request_confirmation` for the current issue's `plan` revision changes `work_mode = planning` to `work_mode = standard` in the same transaction as the accepted interaction; the existing agent-return transition also moves an eligible `in_review` issue to `todo` without changing its agent owner
 - while a restrictive review policy is stored, changing it requires an actor who is allowed by that row-locked policy
 - the transition into `in_review` and its requester activity record commit atomically, including transitions without an explicit review-interaction binding
 - terminal states: `done | cancelled`
@@ -415,6 +422,7 @@ Operational policy:
   - Default upload allowlist includes common images, PDF, plain text/markdown/JSON/CSV/HTML, ZIP, and video artifacts (`video/mp4`, `video/webm`, `video/quicktime`).
   - Attachment reads are company-scoped and expose stable path metadata: `contentPath`/`openPath` for inline-safe viewing and `downloadPath` for forced download.
   - Inline-safe responses use `Content-Disposition: inline`; unsafe types and explicit download requests use `attachment`.
+  - Script-capable content such as HTML is always served as an attachment with `X-Content-Type-Options: nosniff` and a sandboxed, deny-by-default CSP; it is never rendered inline on the Paperclip origin.
   - Video attachments are inline-safe and support single `Range: bytes=start-end` requests with `206`, `Content-Range`, and `Accept-Ranges: bytes` for browser playback/seeking.
 - Attachment-backed artifact work products use `type: "artifact"`, `provider: "paperclip"`, and metadata with `attachmentId`, `contentType`, `byteSize`, `contentPath`, `openPath`, `downloadPath`, and optional `originalFilename`.
 - Workspace-only file references use work product `metadata.resourceRef` with `kind: "workspace_file"`, `issueId`, `workspaceKind` (`execution_workspace` or `project_workspace`), `workspaceId`, `relativePath`, optional `line`/`column`, and `displayPath`. These references point at files in a workspace; they do not replace attachment-backed artifacts for deliverables that must be inspectable without workspace access.
@@ -510,11 +518,19 @@ V1 non-terminal liveness rule:
 - external waits are durable only when persisted as a bounded monitor/scheduled wake, a first-class blocker with a named owner and action, or healthy delegated child work connected by a blocker edge when the source must wait; parent/child structure alone is not a wait path
 - unmanaged shell jobs, detached sessions, adapter child processes, local polling loops, PIDs, logs, and comments are evidence rather than liveness; a managed runtime service counts only when paired with a persisted monitor, wake, blocker, or delegated issue that owns the next check
 - heartbeat finalization evaluates liveness from persisted Paperclip state; an issue cannot remain healthy `in_progress` solely because the exiting heartbeat started a local/background watcher
-- invalid external-wait recovery queues at most one normal-model continuation per source-state fingerprint, then requires a real blocker or explicit recovery action instead of repeating equivalent recovery wakes; new durable source activity may establish a new fingerprint
+- a continuation cancelled as `issue_continuation_waiting_on_review` first converts a current typed wait target into a first-class wait; without a current target it is classified as `deliberate_wait_without_target` and gives the invokable original owner five normal-model disposition-repair attempts (immediate, then after 60, 120, 240, and 480 seconds, with up to 10 percent jitter)
+- disposition repair revalidates blockers, children, interactions, approvals, monitors, execution stages, queued wakes, active runs, work products, owner invokability, budgets, and governance before every attempt; the attempt bound is keyed by durable source state, so comments or equivalent parked prose do not reset it while durable source-state changes may establish a new fingerprint
+- backwards-compatible upgrades count consecutive historical `issue_continuation_waiting_on_review` cancellations for the unchanged accepted-interaction source state against the same five-attempt disposition-repair ceiling; missing pre-upgrade recovery-action rows do not reset the budget
+- the source fingerprint, source-attempt count, next due time, source owner, and return owner persist in the recovery action; startup and periodic reconciliation resume that exact lineage without duplicate wakes, fold it when a current typed wait appears, and reschedule or escalate an expired action that has no live scheduled run
+- source-attempt exhaustion opens one board-owned source-scoped recovery action without changing the source assignee and without waking a substitute agent; the board explicitly chooses whether to repair, retry the original owner, reassign, or resolve
+- an active recovery action counts as a live source or blocker-chain path only while its owner has a live run, queued wake, scheduled retry, typed wait, or explicit board escalation; source and blocker projections consume the same nested recovery-path result
 - when Paperclip cannot safely infer the next action, it surfaces the problem through visible blocked/recovery work instead of silently completing or reassigning work
 - explicit recovery actions are the liveness primitive; source-scoped actions are the default form, issue-backed recovery is a fallback for independent repair work or safety boundaries, and comments alone are evidence rather than a healthy liveness path
-- source-scoped recovery routing is cause-keyed: lost processes, missing successful-run dispositions, and output-inactivity terminations retry the original agent when invokable; provider-quota failures create/reuse a scheduled wait-recovery monitor without a takeover wake; workspace validation and unknown causes route to the manager ladder
-- recovery-scoped wakes replace the normal deliverable execution contract with a cause-specific recovery contract, and successful repair returns the issue to the recorded original owner by default while recording `handed_back` versus `owner_completed`
+- recovery-action ownership is separate from source-task ownership: automatic repair and board escalation preserve both source assignee fields; reassignment requires an explicit board decision or a policy-defined serious failure
+- source-scoped recovery routing is cause-keyed: bounded continuity and disposition repair may retry only the original agent; provider-quota failures create/reuse a scheduled wait-recovery monitor; every other exhausted or unsafe path creates/reuses a board-owned recovery action with `routingPolicy: board_escalation_no_takeover_v1` and no substitute-agent wake
+- legacy active agent-owned recovery actions remain readable, resolvable, and API-compatible after upgrade, but reconciliation does not enqueue another takeover wake for them
+- active-run output silence is an informational board UI signal at one hour (`suspicious`) and four hours (`critical`); it does not create or update issues or recovery actions, comment on or block source work, change assignments, or wake an agent
+- board snooze and continue decisions suppress the run signal until their stored re-arm time; a false-positive decision suppresses it permanently for that run; open legacy evaluation issues remain readable and manually resolvable without automatic refresh
 
 Detailed ownership, execution, blocker, active-run watchdog, crash-recovery, and non-terminal liveness semantics are documented in `doc/execution-semantics.md`.
 
@@ -552,7 +568,7 @@ Detailed ownership, execution, blocker, active-run watchdog, crash-recovery, and
 |---|---|---|
 | Create company | yes | no |
 | Hire/create agent | yes (direct) | request via approval |
-| Pause/resume agent | yes | no |
+| Pause/resume agent | yes | pause: no; resume: direct `agents:configure` grant only |
 | Create/update task | yes | yes |
 | Force reassign task | yes | limited |
 | Approve strategy/hire requests | yes | no |
@@ -562,6 +578,13 @@ Detailed ownership, execution, blocker, active-run watchdog, crash-recovery, and
 | Manage responsible user's inbox state | yes | yes (default-open policy) |
 | Manage another user's inbox state | yes | saved target-user opt-in or scoped `inbox:manage` grant |
 | Set work-object visibility (issue/project) | no | no (pro gate) |
+
+Agent resume is the only grant-gated exception in the lifecycle-route group. An
+agent actor calling `POST /agents/:agentId/resume` must pass the protected
+`agent_config:update` decision with `scope.requiresChangeGrant: true`; self
+access does not bypass that decision, and `agents:suggest-changes` alone cannot
+apply the lifecycle change. Pause, clear-error, terminate, approval, and
+key-management routes remain board-only.
 
 ### 9.3.1 Shared default-open issue writes
 
@@ -690,8 +713,10 @@ old creator-excluding behavior as canonical `not_creator`, legacy `board_only` r
 become `human_only`, and both are marked `legacy_inherited_restriction`. Resolved
 outcomes and resolver attribution are immutable.
 
-An explicit named addressee and a company-configured cap may narrow the effective
-audience. A cap never widens the requested audience. Tool-action confirmations and
+An explicit named agent or user addressee and a company-configured cap may narrow
+the effective audience. Only the exact named addressee may resolve an addressed
+interaction; a human does not override a user addressee. A cap never widens the
+requested audience. Tool-action confirmations and
 other hard-governed action cards remain `human_only` (or move to the formal approval
 system) regardless of a requested open audience.
 
@@ -1014,6 +1039,17 @@ instances return `404`.
 - `GET /issues/:issueId/attachments`
 - `GET /attachments/:attachmentId/content`
 - `DELETE /attachments/:attachmentId`
+- `GET /issues/:issueId/runner-goal?agentId=...`
+- `POST /issues/:issueId/runner-goal/actions`
+
+The runner-goal endpoints control an issue-scoped durable agent-session goal,
+not a row in the company `goals` hierarchy. Reads return the effective agent,
+negotiated capability, normalized goal snapshot, active-run state, pending
+action, and revision. Mutations require a request id, assigned agent, expected
+revision, and a negotiated action; they return `202`, replay the original result
+for a duplicate request id, and return `409` with the current projection for a
+stale revision or an unconfirmed unfinished-goal replacement. These controls do
+not create issue comments.
 
 ### 10.4.1 Atomic Checkout Contract
 
@@ -1140,6 +1176,17 @@ interface AgentAdapter {
 }
 ```
 
+### Local adapter engine availability
+
+For the legacy Codex, Claude, Gemini, and Kimi local adapters, an omitted engine
+or legacy `auto` value selects ACP deterministically. Missing prerequisites or
+ACP execution failures fail the run; they must not launch a different engine
+with different session, permission, or sandbox semantics. CLI execution requires
+explicit selection. Environment tests report the same engine availability error
+as execution. Codex CLI defaults permit workspace writes and network access for
+Paperclip coordination without disabling its sandbox; explicit operator
+restrictions and execution-target network denials remain effective.
+
 ## 11.2 Process Adapter
 
 Config shape:
@@ -1188,11 +1235,11 @@ Behavior:
 - `thin`: send IDs and pointers only; agent fetches context via API
 - `fat`: include current assignments, goal summary, budget snapshot, and recent comments
 
-## 11.5 Recovery Model Profiles
+## 11.5 Recovery Work Classes
 
-The optional `modelProfiles.cheap` lane is not a retry worker lane. Paperclip may request the cheap profile only for status-only recovery coordination, and those wakes must include guard context that prevents deliverable work and document/plan updates (`allowDeliverableWork: false`, `allowDocumentUpdates: false`, `resumeRequiresNormalModel: true`).
+Status-only recovery coordination must include guard context that prevents deliverable work and document or plan updates (`allowDeliverableWork: false`, `allowDocumentUpdates: false`, `resumeRequiresNormalModel: true`). Recovery work classes do not select or change the agent model.
 
-Failed source-work retries, process-loss retries, transient/scheduled retries, max-turn continuations, source-assignee continuations, and downstream source-work child/requeue/resume contexts must use the normal/original model lane. If cheap recovery repairs liveness while actual work remains, the next live continuation path must be a separate normal-model worker run with cheap hints scrubbed.
+Failed source-work retries, process-loss retries, transient or scheduled retries, max-turn continuations, source-assignee continuations, and downstream source-work child, requeue, or resume contexts use the agent's configured model. If status-only recovery repairs liveness while actual work remains, the next live continuation path must be a separate worker run.
 
 ## 11.6 Scheduler Rules
 
@@ -1207,6 +1254,35 @@ Scheduler must skip invocation when:
 - agent is paused/terminated
 - an existing run is active
 - hard budget limit has been hit
+
+## 11.7 Durable agent session goals
+
+Runner Protocol v2 negotiates a required `sessionGoals` capability and typed
+`session.goal.*` commands and events. PRP v1 sessions remain supported and are
+goal unsupported. The Codex app-server driver maps controls to
+`thread/goal/get`, `thread/goal/set`, and `thread/goal/clear`; it observes
+provider-created goal notifications and reconciles with an authoritative get
+after each turn. An active goal suppresses premature run terminalization while
+autonomous turns continue. The Paperclip runner's persistent ACP backend opts
+in through the `_session/goal` extension and advertises its exact action subset.
+Its pinned Codex/Claude executables retain the runner's Linux x64 qualification
+requirement. Direct `codex_local` and `claude_local` adapters currently have no
+live goal controller and remain unsupported, even when their underlying ACP
+package exposes goals. Goal actions never change an agent's adapter, model,
+permission policy, or rollout settings to manufacture support. CLI, one-shot
+ACP, and providers without the structured extension remain unsupported.
+
+When a goal heartbeat settles, the runner suspends its durable authority even
+under a warm lifecycle policy. Paused, blocked, completed, and rollover goals
+must survive controller restart without relying on an in-memory warm owner.
+The next run resumes the same provider session through the existing verified
+checkpoint and authority-rotation path.
+
+The board composer treats `/goal` as an action command rather than Markdown or
+comment text. It is capability-aware, and the issue thread renders durable goal
+status and controls immediately above the composer. Goal completion enters the
+normal run-result/completion arbitration path and does not directly close the
+issue.
 
 ## 12. Governance and Approval Flows
 
@@ -1235,6 +1311,22 @@ Board can at any time:
 - reassign or cancel any task
 - edit budgets and limits
 - approve/reject/cancel pending approvals
+
+## 12.4 Connection Tool Reviews
+
+Ask-first connection calls use a server-owned tool-action confirmation linked to
+the authoritative action request. The task feed retains a stable record; dismissal
+only hides the composer takeover. Task and Connections decisions share one
+transaction. Approval runs stored, signed arguments once; decline runs nothing.
+The human decision remains distinct from provider execution success or failure.
+
+Always allow remembers the same agent, connection, and action, restricted to the
+current project when present, with future argument values permitted. Explicit
+denials, revoked access, catalog-definition changes, and formal approval gates
+remain effective. A durable continuation receipt resumes eligible task context
+with the recorded outcome after the agent yields. Uncertain interrupted execution
+is surfaced without automatic replay. See [Task reviews](connections/TASK-REVIEWS.md)
+for contracts, recovery behavior, Storybook, and acceptance workflows.
 
 ## 13. Cost and Budget System
 
@@ -1307,7 +1399,7 @@ Required UX behaviors:
 
 ## 15.1 Environment
 
-- Node 20+
+- Node 24.11+
 - `DATABASE_URL` optional
 - if unset, auto-use embedded PostgreSQL under `~/.paperclip/instances/default/db`
 
@@ -1337,6 +1429,10 @@ Required UX behaviors:
 - CSRF protection for board session endpoints
 - rate limit auth and key-management endpoints
 - strict company boundary checks on every entity fetch/mutation
+- restricted `skill_test` and `task_bridge` keys cannot enumerate company-wide run telemetry, workspace-operation logs, or the company secret catalog
+- HTTP adapters use DNS-pinned outbound requests, reject redirects and link-local/metadata targets, and require an exact server-owner origin allowlist for private destinations
+- external instruction bundle roots and exports that read them require instance-admin access; managed company-scoped bundles remain available through normal company authorization
+- agent-authenticated callers cannot persist host-executed workspace commands, and restricted keys cannot invoke preconfigured workspace runtime controls
 
 ## 17. Testing Strategy
 

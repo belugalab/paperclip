@@ -1,267 +1,58 @@
-import type { Db } from "@paperclipai/db";
+import {
+  companySecrets,
+  heartbeatRuns,
+  companyMemberships,
+  connectionGrantDelegations,
+  connectionGrants,
+  toolConnectionInstalls,
+  toolConnections,
+  userSecretDefinitions,
+  type Db,
+} from "@paperclipai/db";
+import { and, eq, inArray, or } from "drizzle-orm";
+import { isGitHubDotCom } from "./github-fetch.js";
 import { secretService } from "./secrets.js";
+import { toolAccessService } from "./tool-access.js";
 
 /**
  * Server-side git credentials for managed project checkouts and execution-workspace base
- * refreshes. Operators store a provider token as a company secret under one of the well-known
- * names below (the same convention the GitHub external-object provider reads for GitHub);
- * this module resolves it and turns it into a git invocation that authenticates clone/fetch
- * against the matching host over HTTPS without ever placing the token in argv, URLs, or on
- * disk.
+ * refreshes. Operators store a GitHub token as a company secret under one of the well-known
+ * names below (the same convention the GitHub external-object provider reads); this module
+ * resolves it and turns it into a git invocation that authenticates clone/fetch against
+ * github.com over HTTPS without ever placing the token in argv, URLs, or on disk.
  *
  * The provider factory is deliberately the single seam for future credential sources (for
- * example a brokered GitHub or GitLab connection): swap the factory, keep every call site
- * unchanged. Adding a new git host means adding one entry to `GIT_HOST_PROVIDERS` below —
- * nothing else in this module or its callers is host-specific.
- *
- * GitLab additionally supports a self-managed instance at an operator-chosen domain (there is
- * no equivalent for GitHub — GHES stays out of scope, as it always has been here): set
- * `PAPERCLIP_GITLAB_HOSTS` to that instance's `host[:port]` (comma-separated for more than one;
- * include the port explicitly if the instance runs on a non-default one, e.g.
- * `gitlab.mycompany.com:1234` — omitting it only matches the default HTTPS port) and the same
- * `GITLAB_TOKEN`/`PAPERCLIP_GITLAB_TOKEN` company secret or `GITLAB_TOKEN` server env used for
- * gitlab.com now also authenticates that host, with the credential helper scoped strictly to
- * it — never to gitlab.com or a different configured self-managed host.
- *
- * A self-managed instance on a private/internal CA (common — that is usually the whole reason
- * it is self-managed) can additionally set `PAPERCLIP_GITLAB_CA_CERT_PATH` to a PEM bundle file
- * on the server's own filesystem. It is applied only to a self-hosted match, never to
- * gitlab.com: `GIT_SSL_CAINFO` *replaces* git's default trust store for the git process it is
- * set on rather than adding to it, so applying it unconditionally would break TLS verification
- * for the public SaaS domain unless that bundle happened to also carry the public roots.
+ * example a brokered GitHub connection): swap the factory, keep every call site unchanged.
  */
-
-export type GitProviderId = "github" | "gitlab";
-
-type GitHostProviderConfig = {
-  id: GitProviderId;
-  /** Human-readable name used in auth-failure guidance, e.g. "GitHub". */
-  label: string;
-  /** Well-known SaaS hosts this provider answers for. `www.` variants included where served. */
-  hosts: readonly string[];
-  /** The HTTPS Basic username paired with the token — provider-specific by convention. */
-  tokenUsername: string;
-  /** Company-secret names probed for this provider's token, in priority order. */
-  secretNames: readonly string[];
-  /** Server-process env var names probed as a fallback, in priority order. */
-  envNames: readonly string[];
-  /**
-   * Server env var naming this provider's self-managed instance host(s), for operators who
-   * run their own server on a custom domain (GitLab's self-hosted offering; there is no
-   * equivalent GHES support here, matching this module's prior GHES-out-of-scope stance).
-   * Comma-separated; each entry is a bare `host[:port]` or a full URL (only `host[:port]` is
-   * used — an explicit non-default port must be included, since it is not inferred).
-   * Undefined for a provider with no self-hosted mode.
-   */
-  selfHostedEnvName?: string;
-  /**
-   * Server env var naming a PEM CA bundle file trusted for this provider's self-managed
-   * instance(s) — for a private/internal CA the public trust store does not include. Applied
-   * only when the matched remote is self-hosted (never for the provider's SaaS domain — see
-   * the module doc comment for why). Undefined for a provider with no self-hosted mode.
-   */
-  selfHostedCaCertEnvName?: string;
-};
 
 /** Company-secret names probed for a GitHub token, in priority order. */
 export const DEFAULT_GITHUB_TOKEN_SECRET_NAMES = ["GITHUB_TOKEN", "GH_TOKEN", "PAPERCLIP_GITHUB_TOKEN"] as const;
-
-/** Company-secret names probed for a GitLab token, in priority order. */
-export const DEFAULT_GITLAB_TOKEN_SECRET_NAMES = ["GITLAB_TOKEN", "PAPERCLIP_GITLAB_TOKEN"] as const;
-
-/**
- * Supported git hosts, most specific matching first. `hosts` must stay in sync with
- * `isGitHubDotCom`-style host checks elsewhere in the codebase (`github-fetch.ts`) — GitHub's
- * entry mirrors that list rather than importing it, so this module has no dependency on the
- * GitHub-specific fetch helpers.
- */
-const GIT_HOST_PROVIDERS: readonly GitHostProviderConfig[] = [
-  {
-    id: "github",
-    label: "GitHub",
-    hosts: ["github.com", "www.github.com"],
-    tokenUsername: "x-access-token",
-    secretNames: DEFAULT_GITHUB_TOKEN_SECRET_NAMES,
-    envNames: ["GITHUB_TOKEN", "GH_TOKEN"],
-  },
-  {
-    id: "gitlab",
-    label: "GitLab",
-    hosts: ["gitlab.com", "www.gitlab.com"],
-    // GitLab's HTTPS PAT/project-access-token convention: any non-empty username works, but
-    // `oauth2` is GitLab's own documented convention for token-based HTTPS auth. It applies
-    // the same way to a self-managed instance as it does to gitlab.com.
-    tokenUsername: "oauth2",
-    secretNames: DEFAULT_GITLAB_TOKEN_SECRET_NAMES,
-    envNames: ["GITLAB_TOKEN"],
-    selfHostedEnvName: "PAPERCLIP_GITLAB_HOSTS",
-    selfHostedCaCertEnvName: "PAPERCLIP_GITLAB_CA_CERT_PATH",
-  },
-];
-
-function getGitHostProvider(id: GitProviderId): GitHostProviderConfig {
-  const provider = GIT_HOST_PROVIDERS.find((p) => p.id === id);
-  if (!provider) throw new Error(`Unknown git host provider: ${id}`);
-  return provider;
-}
-
-/**
- * Extract a lowercase `host[:port]` from an operator-supplied entry in a `selfHostedEnvName`
- * value: either a full URL (`https://gitlab.mycompany.com:1234/`) or a bare
- * `host[:port]` (`gitlab.mycompany.com:1234`). Returns null for an empty or unparseable entry.
- *
- * Deliberately `URL.host`, not `URL.hostname`: git's credential protocol carries the port as
- * part of its `host=` field on a non-default port, and `credential.<url>.helper` config keys
- * are matched port-for-port — a config key that omits the port is consulted only for the
- * scheme's default port (443 for https), never for an arbitrary one. Dropping the port here
- * would silently make a self-hosted instance on a custom port unreachable end-to-end: the
- * helper would never even be consulted, let alone answer.
- */
-function normalizeConfiguredHost(value: string): string | null {
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  try {
-    const url = new URL(trimmed.includes("://") ? trimmed : `https://${trimmed}`);
-    return url.host.toLowerCase() || null;
-  } catch {
-    return null;
-  }
-}
-
-/** This provider's operator-configured self-managed instance hosts, deduplicated. */
-function resolveConfiguredSelfHostedHosts(provider: GitHostProviderConfig, env: NodeJS.ProcessEnv): string[] {
-  if (!provider.selfHostedEnvName) return [];
-  const raw = env[provider.selfHostedEnvName];
-  if (!raw) return [];
-  const hosts = new Set<string>();
-  for (const entry of raw.split(",")) {
-    const host = normalizeConfiguredHost(entry);
-    if (host) hosts.add(host);
-  }
-  return Array.from(hosts);
-}
-
-/** This provider's operator-configured self-managed CA bundle path, if any. */
-function resolveConfiguredCaCertPath(provider: GitHostProviderConfig, env: NodeJS.ProcessEnv): string | undefined {
-  if (!provider.selfHostedCaCertEnvName) return undefined;
-  return env[provider.selfHostedCaCertEnvName]?.trim() || undefined;
-}
-
-/**
- * Resolve the supported provider for one remote URL, or null when the URL is out of scope:
- * non-HTTPS, an unsupported host, or already credentialed (inline userinfo, which this module
- * must never override). Mirrors `isGitHubHttpsRemoteUrl`'s prior scoping rules, generalized
- * across every entry in `GIT_HOST_PROVIDERS`. Static SaaS hosts only — no `env`, so it never
- * depends on ambient process state; self-hosted matching lives in `resolveGitHostMatch` below,
- * which every real credential-resolution path uses instead.
- */
-function resolveGitHostProvider(remoteUrl: string): GitHostProviderConfig | null {
-  let parsed: URL;
-  try {
-    parsed = new URL(remoteUrl);
-  } catch {
-    return null;
-  }
-  if (parsed.protocol !== "https:") return null;
-  if (parsed.username || parsed.password) return null;
-  const hostname = parsed.hostname.toLowerCase();
-  return GIT_HOST_PROVIDERS.find((provider) => provider.hosts.includes(hostname)) ?? null;
-}
-
-/**
- * The full match used by real credential resolution: static SaaS hosts first, then each
- * provider's operator-configured self-hosted hosts (env-driven, see `selfHostedEnvName`).
- * `scopedHosts` is what the credential helper gets installed for — the provider's whole SaaS
- * host list for a SaaS match (unchanged from before self-hosted support existed), or exactly
- * the one matched self-hosted host and no other configured self-hosted host, so one
- * self-managed instance's token is never offered to a different self-managed instance or to
- * the SaaS domain. `selfHosted` tells the caller whether it is safe to also apply a configured
- * CA bundle (see `selfHostedCaCertEnvName`) — never for a SaaS match.
- */
-function resolveGitHostMatch(
-  remoteUrl: string,
-  env: NodeJS.ProcessEnv,
-): { provider: GitHostProviderConfig; scopedHosts: readonly string[]; selfHosted: boolean } | null {
-  const staticProvider = resolveGitHostProvider(remoteUrl);
-  if (staticProvider) return { provider: staticProvider, scopedHosts: staticProvider.hosts, selfHosted: false };
-
-  let parsed: URL;
-  try {
-    parsed = new URL(remoteUrl);
-  } catch {
-    return null;
-  }
-  if (parsed.protocol !== "https:" || parsed.username || parsed.password) return null;
-  // `.host`, not `.hostname` — see `normalizeConfiguredHost` for why the port must survive to
-  // this comparison and into `scopedHosts`.
-  const hostWithPort = parsed.host.toLowerCase();
-  for (const provider of GIT_HOST_PROVIDERS) {
-    if (resolveConfiguredSelfHostedHosts(provider, env).includes(hostWithPort)) {
-      return { provider, scopedHosts: [hostWithPort], selfHosted: true };
-    }
-  }
-  return null;
-}
-
-/**
- * True only for `https://github.com/...` (or `www.`) URLs without inline userinfo. GHES and
- * other hosts are out of scope — sending a github.com token to an arbitrary host would leak
- * it, and an operator's inline URL credential must never be overridden. Static-only: unlike
- * real credential resolution, this helper never consults `PAPERCLIP_GITLAB_HOSTS`-style
- * self-hosted config, so it stays a pure function of its argument.
- */
-export function isGitHubHttpsRemoteUrl(remoteUrl: string): boolean {
-  return resolveGitHostProvider(remoteUrl)?.id === "github";
-}
-
-/**
- * True only for `https://gitlab.com/...` (or `www.`) URLs without inline userinfo. Static-only:
- * a self-managed GitLab instance configured via `PAPERCLIP_GITLAB_HOSTS` is a supported
- * credential target (see `createGitRemoteAuthProvider`) but does not make this function true —
- * this helper is a pure function of its argument, not of ambient server config.
- */
-export function isGitLabHttpsRemoteUrl(remoteUrl: string): boolean {
-  return resolveGitHostProvider(remoteUrl)?.id === "gitlab";
-}
 
 /** Env var the credential helper reads the token from; never appears in argv. */
 export const GIT_CREDENTIAL_TOKEN_ENV_KEY = "PAPERCLIP_GIT_TOKEN";
 
 // `!`-prefixed helpers run via `sh -c` with the credential action appended as "$1". Only the
-// `get` action answers; store/erase drain stdin and exit 0 silently. The username is fixed per
-// provider (`x-access-token` authenticates classic PATs, fine-grained PATs, and GitHub App
-// installation tokens alike; `oauth2` is GitLab's HTTPS token-auth convention).
+// `get` action answers; store/erase drain stdin and exit 0 silently. `x-access-token`
+// authenticates classic PATs, fine-grained PATs, and GitHub App installation tokens alike.
 //
 // The helper re-validates the credential request from its stdin description and answers only
-// for `protocol=https` + one of the provider's own hosts. The pre-invocation URL check runs
-// before git applies configuration like repository-local `url.<base>.insteadOf` rewrites, so a
-// rewritten remote could otherwise request the token for an arbitrary host. The helper is
-// additionally installed URL-scoped per host (`credential.https://<host>.helper`) so git does
-// not consult it for other hosts in the first place — two independent gates.
-// A bracketed IPv6 host (from `normalizeConfiguredHost`, e.g. `[2001:db8::1]:8443`) would
-// otherwise land in the `case` pattern below unescaped, where `[`/`]` are glob character-class
-// metacharacters rather than literal brackets — the pattern would then fail to match the
-// literal host git requests, and the helper would never authenticate that self-hosted instance.
-function escapeCasePattern(value: string): string {
-  return value.replace(/[\\*?[\]]/g, "\\$&");
-}
-
-function buildCredentialHelperScript(tokenUsername: string, hosts: readonly string[]): string {
-  const hostMatch = hosts.map((host) => `host=${escapeCasePattern(host)}`).join("|");
-  return (
-    `!f() { ok=; proto=; while IFS= read -r l && [ -n "$l" ]; do case "$l" in ` +
-    `${hostMatch}) ok=1;; protocol=https) proto=1;; esac; done; ` +
-    `if [ "$1" = get ] && [ -n "$ok" ] && [ -n "$proto" ]; then printf 'username=${tokenUsername}\\npassword=%s\\n' "$PAPERCLIP_GIT_TOKEN"; fi; }; f`
-  );
-}
+// for `protocol=https` + `host=github.com`/`www.github.com`. The pre-invocation URL check
+// runs before git applies configuration like repository-local `url.<base>.insteadOf`
+// rewrites, so a rewritten remote could otherwise request the token for an arbitrary host.
+// The helper is additionally installed URL-scoped (`credential.https://github.com.helper`)
+// so git does not consult it for other hosts in the first place — two independent gates.
+const GIT_CREDENTIAL_HELPER =
+  `!f() { ok=; proto=; while IFS= read -r l && [ -n "$l" ]; do case "$l" in host=github.com|host=www.github.com) ok=1;; protocol=https) proto=1;; esac; done; if [ "$1" = get ] && [ -n "$ok" ] && [ -n "$proto" ]; then printf 'username=x-access-token\\npassword=%s\\n' "$PAPERCLIP_GIT_TOKEN"; fi; }; f`;
 
 export type GitCredential = {
   token: string;
-  source: "company_secret" | "server_env";
+  source: "managed_connection" | "company_secret" | "server_env";
   /** The company-secret name the token came from; null for a server-environment token. */
   secretName: string | null;
-  /** Which host provider this token authenticates against. */
-  providerId: GitProviderId;
+  githubIdentity?: { userId: string; login: string };
+  identitySource?: "personal" | "dedicated";
+  connectionId?: string;
+  grantId?: string;
 };
 
 /** A prepared, credential-bearing git invocation: config args plus the env that carries the token. */
@@ -270,21 +61,42 @@ export type GitAuthInvocation = {
   env: Record<string, string>;
   source: GitCredential["source"];
   secretName: string | null;
-  providerId: GitProviderId;
-  /**
-   * Human-readable provider name for auth-failure warnings, e.g. "GitHub" or "GitLab".
-   * Structurally mirrors `workspace-runtime.ts`'s decoupled `GitRemoteAuthInvocation` type, so
-   * that module can build a provider-neutral warning without importing `GitProviderId`.
-   */
-  providerLabel: string;
 };
 
 /**
- * Resolve auth for one remote URL. Returns null when the URL is out of scope (unsupported
- * host, ssh, or already credentialed) or when no token is available — callers then run git
- * with ambient behavior, exactly as before this module existed.
+ * Resolve auth for one remote URL. Returns null when the URL is out of scope (non-GitHub,
+ * ssh, or already credentialed) or when no token is available — callers then run git with
+ * ambient behavior, exactly as before this module existed.
  */
 export type GitRemoteAuthProvider = (remoteUrl: string) => Promise<GitAuthInvocation | null>;
+
+/**
+ * True only for `https://github.com/...` (or `www.`) URLs without inline userinfo. GHES and
+ * other hosts are out of scope for now — sending a github.com token to an arbitrary host
+ * would leak it, and an operator's inline URL credential must never be overridden.
+ */
+export function isGitHubHttpsRemoteUrl(remoteUrl: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(remoteUrl);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "https:") return false;
+  if (parsed.username || parsed.password) return false;
+  return isGitHubDotCom(parsed.hostname);
+}
+
+function isSupportedGitHubRemoteUrl(remoteUrl: string): boolean {
+  if (isGitHubHttpsRemoteUrl(remoteUrl)) return true;
+  if (/^git@(?:www\.)?github\.com:[^\s]+$/i.test(remoteUrl)) return true;
+  try {
+    const parsed = new URL(remoteUrl);
+    return parsed.protocol === "ssh:" && parsed.username === "git" && !parsed.password && isGitHubDotCom(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Mask credential material embedded in URLs so it never reaches warnings, run errors, or
@@ -300,52 +112,52 @@ export function scrubGitCredentialText(text: string): string {
     .replace(/([a-z][a-z0-9+.-]*:\/\/[^\s"'?]*)\?[^\s"']*/gi, "$1?***");
 }
 
-export function buildGitAuthInvocation(
-  credential: GitCredential,
-  /**
-   * Hosts to install the credential helper for. Defaults to the provider's full SaaS host
-   * list (e.g. github.com + www.github.com). Real credential resolution
-   * (`createGitRemoteAuthProvider`) passes a narrower list — exactly the one matched
-   * self-hosted host — when the remote is a self-managed instance, so that host's token is
-   * never offered to a different host, including the provider's own SaaS domain.
-   */
-  scopedHosts?: readonly string[],
-  /**
-   * A PEM CA bundle path to trust via `GIT_SSL_CAINFO`, for a self-hosted instance on a
-   * private/internal CA. Callers must pass this only alongside a self-hosted `scopedHosts`
-   * (never for a SaaS match): `GIT_SSL_CAINFO` replaces git's default trust store for the git
-   * process it is set on, so applying it to a gitlab.com clone would break that clone's TLS
-   * verification unless the bundle also carried the public roots.
-   */
-  caCertPath?: string,
-): GitAuthInvocation {
-  const provider = getGitHostProvider(credential.providerId);
-  const hosts = scopedHosts ?? provider.hosts;
-  const helperScript = buildCredentialHelperScript(provider.tokenUsername, hosts);
-  // The leading empty helper clears ambient helpers (gh, glab, osxkeychain, credential-store)
-  // so they neither outrank the resolved token nor receive store/erase callbacks for it. Each
-  // subsequent entry installs the token helper URL-scoped to one of the resolved hosts: git
-  // consults it only for credential requests whose context matches that host over https, so an
-  // `insteadOf`-rewritten remote never reaches it (and the helper itself re-checks the request
-  // host — see above).
-  const configArgs: string[] = ["-c", "credential.helper="];
-  for (const host of hosts) {
-    configArgs.push("-c", `credential.https://${host}.helper=${helperScript}`);
-  }
-  const env: Record<string, string> = {
-    [GIT_CREDENTIAL_TOKEN_ENV_KEY]: credential.token,
-    GIT_TERMINAL_PROMPT: "0",
-  };
-  if (caCertPath) {
-    env.GIT_SSL_CAINFO = caCertPath;
-  }
+export function buildGitAuthInvocation(credential: GitCredential): GitAuthInvocation {
+  const identity = credential.githubIdentity;
+  const noreplyEmail = identity ? `${identity.userId}+${identity.login}@users.noreply.github.com` : null;
+  const configEntries = [
+    ["credential.helper", ""],
+    ["credential.https://github.com.helper", GIT_CREDENTIAL_HELPER],
+    ["credential.https://www.github.com.helper", GIT_CREDENTIAL_HELPER],
+    ["url.https://github.com/.insteadOf", "git@github.com:"],
+    ["url.https://github.com/.insteadOf", "ssh://git@github.com/"],
+    ["url.https://github.com/.insteadOf", "git@www.github.com:"],
+    ["url.https://github.com/.insteadOf", "ssh://git@www.github.com/"],
+    ...(identity ? [
+      ["user.name", identity.login],
+      ["user.email", noreplyEmail!],
+    ] : []),
+  ];
   return {
-    configArgs,
-    env,
+    // The leading empty helper clears ambient helpers (gh, osxkeychain, credential-store) so
+    // they neither outrank the resolved token nor receive store/erase callbacks for it. The
+    // token helper is installed URL-scoped: git consults it only for credential requests
+    // whose context matches github.com over https, so an `insteadOf`-rewritten remote never
+    // reaches it (and the helper itself re-checks the request host — see above).
+    configArgs: [
+      "-c", "credential.helper=",
+      "-c", `credential.https://github.com.helper=${GIT_CREDENTIAL_HELPER}`,
+      "-c", `credential.https://www.github.com.helper=${GIT_CREDENTIAL_HELPER}`,
+    ],
+    env: {
+      [GIT_CREDENTIAL_TOKEN_ENV_KEY]: credential.token,
+      GH_TOKEN: credential.token,
+      GITHUB_TOKEN: credential.token,
+      GIT_TERMINAL_PROMPT: "0",
+      ...(identity ? {
+        GIT_AUTHOR_NAME: identity.login,
+        GIT_AUTHOR_EMAIL: noreplyEmail!,
+        GIT_COMMITTER_NAME: identity.login,
+        GIT_COMMITTER_EMAIL: noreplyEmail!,
+      } : {}),
+      GIT_CONFIG_COUNT: String(configEntries.length),
+      ...Object.fromEntries(configEntries.flatMap(([key, value], index) => [
+        [`GIT_CONFIG_KEY_${index}`, key],
+        [`GIT_CONFIG_VALUE_${index}`, value],
+      ])),
+    },
     source: credential.source,
     secretName: credential.secretName,
-    providerId: credential.providerId,
-    providerLabel: provider.label,
   };
 }
 
@@ -357,36 +169,23 @@ const GIT_AUTH_FAILURE_PATTERN =
  * Returns null when the failure does not look auth-related — a credential that was merely
  * present during an unrelated failure (network outage, target-path collision) must not be
  * blamed for it.
- *
- * `remoteUrl` lets the no-credential-used branch name the right provider's guidance even
- * though no credential was resolved; it is ignored once `used.providerId` is known. `env`
- * (defaulting to `process.env`) lets that branch also recognize an operator-configured
- * self-hosted GitLab host via `PAPERCLIP_GITLAB_HOSTS`.
  */
 export function describeGitAuthFailure(input: {
   error: string;
-  used: { source: GitCredential["source"]; secretName: string | null; providerId?: GitProviderId } | null;
-  remoteUrl?: string | null;
-  env?: NodeJS.ProcessEnv;
+  used: { source: GitCredential["source"]; secretName: string | null } | null;
 }): string | null {
   if (!GIT_AUTH_FAILURE_PATTERN.test(input.error)) {
     return null;
   }
-  const provider = input.used?.providerId
-    ? getGitHostProvider(input.used.providerId)
-    : (input.remoteUrl ? resolveGitHostMatch(input.remoteUrl, input.env ?? process.env)?.provider ?? null : null);
   if (input.used) {
-    const providerLabel = provider?.label ?? "git";
     const label = input.used.secretName
-      ? `the ${input.used.secretName} company-secret ${providerLabel} credential`
-      : `the server-environment ${providerLabel} credential`;
+      ? `the ${input.used.secretName} company-secret GitHub credential`
+      : input.used.source === "managed_connection"
+        ? "the resolved GitHub connection"
+      : "the server-environment GitHub credential";
     return `The operation authenticated with ${label}, which was rejected or lacks access to this repository.`;
   }
-  if (provider) {
-    const names = provider.secretNames.filter((name) => !name.startsWith("PAPERCLIP_")).join(" or ");
-    return `No ${provider.label} credential is configured — add a ${names} company secret in Settings → Secrets, or configure a local checkout cwd for this project workspace.`;
-  }
-  return "No git credential is configured — add a GITHUB_TOKEN/GH_TOKEN or GITLAB_TOKEN company secret in Settings → Secrets, or configure a local checkout cwd for this project workspace.";
+  return "No GitHub credential is configured — add a GITHUB_TOKEN or GH_TOKEN company secret in Settings → Secrets, or configure a local checkout cwd for this project workspace.";
 }
 
 type SecretServiceLike = ReturnType<typeof secretService>;
@@ -397,15 +196,16 @@ type GitCredentialSecretsDeps = {
     name: string,
   ) => Promise<{ id: string } | null | undefined> | ReturnType<SecretServiceLike["getByName"]>;
   resolveSecretValue: SecretServiceLike["resolveSecretValue"];
+  resolveUserSecretValue?: SecretServiceLike["resolveUserSecretValue"];
 };
 
 /**
- * Build the credential provider for one run. Resolution order per host: company secret by
- * well-known name (in that provider's declared order), then the server process env for
- * self-hosted operators, then null. Lookups are memoized per resolved provider — a run that
- * touches both a GitHub and a GitLab remote performs at most one secret resolution per host
- * (and writes at most one audit event per host) no matter how many git operations it
- * authenticates.
+ * Build the credential provider for one run. Resolution order: the managed GitHub identity
+ * resolver, then a company secret by well-known name, then the server process environment
+ * (`GITHUB_TOKEN`/`GH_TOKEN`) for self-hosted operators. A configured managed identity fails
+ * closed instead of falling through to legacy credentials. The lookup is memoized per
+ * provider instance so one run performs at most one secret resolution (and writes at most
+ * one audit event) no matter how many git operations it authenticates.
  */
 export function createGitRemoteAuthProvider(
   db: Db,
@@ -414,20 +214,30 @@ export function createGitRemoteAuthProvider(
     issueId?: string | null;
     heartbeatRunId?: string | null;
     responsibleUserId?: string | null;
+    agentId?: string | null;
   },
   deps?: {
     secrets?: GitCredentialSecretsDeps;
     env?: NodeJS.ProcessEnv;
-    /** Overrides the probed company-secret names for every provider a run resolves. Test-only. */
     secretNames?: readonly string[];
   },
 ): GitRemoteAuthProvider {
   const secrets: GitCredentialSecretsDeps = deps?.secrets ?? secretService(db);
   const env = deps?.env ?? process.env;
-  const credentialPromises = new Map<GitProviderId, Promise<GitCredential | null>>();
+  const secretNames = deps?.secretNames ?? DEFAULT_GITHUB_TOKEN_SECRET_NAMES;
+  let credentialPromise: Promise<GitCredential | null> | null = null;
 
-  const resolveCredentialFor = async (provider: GitHostProviderConfig): Promise<GitCredential | null> => {
-    const secretNames = deps?.secretNames ?? provider.secretNames;
+  const resolveCredential = async (): Promise<GitCredential | null> => {
+    // Unit callers historically pass a null DB through the typed test seam. Production
+    // always supplies a real DB and therefore always checks managed identities before
+    // considering legacy secrets or process environment credentials.
+    const managed = db
+      ? await resolveManagedGitHubCredential(db, secrets, companyId, context ?? {})
+      : { configured: false as const };
+    if (managed.configured) {
+      if (!managed.credential) throw new Error(managed.error ?? "Managed GitHub connection is unavailable");
+      return managed.credential;
+    }
     for (const secretName of secretNames) {
       const secret = await Promise.resolve(secrets.getByName(companyId, secretName)).catch(() => null);
       if (!secret) continue;
@@ -446,28 +256,324 @@ export function createGitRemoteAuthProvider(
         })
         .then((value) => value.trim())
         .catch(() => "");
-      if (token) return { token, source: "company_secret", secretName, providerId: provider.id };
+      if (token) return { token, source: "company_secret", secretName };
     }
-    for (const envName of provider.envNames) {
-      const envToken = env[envName]?.trim();
-      if (envToken) return { token: envToken, source: "server_env", secretName: null, providerId: provider.id };
-    }
+    const envToken = env.GITHUB_TOKEN?.trim() || env.GH_TOKEN?.trim() || "";
+    if (envToken) return { token: envToken, source: "server_env", secretName: null };
     return null;
   };
 
   return async (remoteUrl: string) => {
-    const match = resolveGitHostMatch(remoteUrl, env);
-    if (!match) return null;
-    const { provider, scopedHosts, selfHosted } = match;
-    let credentialPromise = credentialPromises.get(provider.id);
-    if (!credentialPromise) {
-      credentialPromise = resolveCredentialFor(provider);
-      credentialPromises.set(provider.id, credentialPromise);
+    if (!isSupportedGitHubRemoteUrl(remoteUrl)) return null;
+    if (db && context?.heartbeatRunId && context.agentId) {
+      const [run] = await db.select({ contextId: heartbeatRuns.activeIdentityContextId }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, context.heartbeatRunId), eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, context.agentId),
+      ));
+      if (run?.contextId) {
+        const { resolveGitHubOperationCredentials } = await import("./github-operation-credentials.js");
+        const result = await resolveGitHubOperationCredentials(db, {
+          companyId, runId: context.heartbeatRunId, agentId: context.agentId,
+        });
+        if (result.status === "absent") {
+          const credential = await resolveCredential();
+          return credential ? buildGitAuthInvocation(credential) : null;
+        }
+        const anonymous = buildGitAuthInvocation({ token: "", source: "managed_connection", secretName: null });
+        return { ...anonymous, env: {
+          ...anonymous.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null",
+          GIT_AUTHOR_NAME: "", GIT_AUTHOR_EMAIL: "", GIT_COMMITTER_NAME: "", GIT_COMMITTER_EMAIL: "",
+          ...result.env,
+        } };
+      }
     }
+    credentialPromise ??= resolveCredential();
     const credential = await credentialPromise;
     if (!credential) return null;
-    // Only ever applied to a self-hosted match -- see buildGitAuthInvocation's caCertPath doc.
-    const caCertPath = selfHosted ? resolveConfiguredCaCertPath(provider, env) : undefined;
-    return buildGitAuthInvocation(credential, scopedHosts, caCertPath);
+    return buildGitAuthInvocation(credential);
   };
+}
+
+export async function resolveManagedGitHubIdentitySelection(
+  db: Db,
+  companyId: string,
+  context: {
+    responsibleUserId?: string | null;
+    agentId?: string | null;
+    allowStandingDelegation?: boolean;
+    excludeGrantId?: string;
+  },
+): Promise<{
+  configured: boolean;
+  identitySource?: "personal" | "dedicated";
+  grant?: typeof connectionGrants.$inferSelect;
+  error?: string;
+}> {
+  const connections = await db.select().from(toolConnections).where(and(
+    eq(toolConnections.companyId, companyId),
+  ));
+  const githubConnections = connections.filter((connection) => {
+    const config = connection.config && typeof connection.config === "object" ? connection.config as Record<string, unknown> : {};
+    const transportConfig = connection.transportConfig && typeof connection.transportConfig === "object"
+      ? connection.transportConfig as Record<string, unknown>
+      : {};
+    return config.sourceTemplateKey === "github" || transportConfig.sourceTemplateKey === "github";
+  });
+  if (githubConnections.length === 0) return { configured: false };
+
+  const connectionIds = githubConnections.map((connection) => connection.id);
+  const installs = await db.select().from(toolConnectionInstalls).where(and(
+    eq(toolConnectionInstalls.companyId, companyId),
+    inArray(toolConnectionInstalls.connectionId, connectionIds),
+  ));
+  const eligibleConnectionIds = new Set(githubConnections.filter((connection) => installs.some((install) =>
+    install.connectionId === connection.id && (
+      (install.targetType === "company" && install.targetId === companyId)
+      || (install.targetType === "agent" && install.targetId === context.agentId)
+    )
+  )).map((connection) => connection.id));
+  // A GitHub connection installed only for another agent is not configured for
+  // this run. Treating the company-wide connection as configured here would
+  // make unrelated agents fail before their adapter starts and would also
+  // suppress their otherwise-eligible legacy credential fallback.
+  if (eligibleConnectionIds.size === 0) return { configured: false };
+  const grants = await db.select().from(connectionGrants).where(and(
+    eq(connectionGrants.companyId, companyId),
+    inArray(connectionGrants.connectionId, [...eligibleConnectionIds]),
+    or(eq(connectionGrants.kind, "agent"), eq(connectionGrants.kind, "user")),
+  ));
+  const dedicated = context.agentId
+    ? grants.filter((grant) => grant.kind === "agent" && grant.subjectAgentId === context.agentId)
+    : [];
+  // Connections are already restricted above to the owner-selected install
+  // targets. Within that consent boundary the server-resolved responsible user
+  // is authoritative; standing delegation is only an ownerless-run fallback.
+  const personal = context.responsibleUserId
+    ? grants.filter((grant) => grant.kind === "user" && grant.subjectUserId === context.responsibleUserId)
+    : [];
+  const delegated = context.allowStandingDelegation !== false && !context.responsibleUserId && context.agentId
+    ? await db.select({ grantId: connectionGrantDelegations.grantId }).from(connectionGrantDelegations).where(and(
+        eq(connectionGrantDelegations.companyId, companyId),
+        eq(connectionGrantDelegations.agentId, context.agentId),
+        inArray(connectionGrantDelegations.grantId, grants.map((grant) => grant.id)),
+      )).then((rows) => {
+        const delegatedIds = new Set(rows.map((row) => row.grantId));
+        return grants.filter((grant) => grant.kind === "user" && delegatedIds.has(grant.id));
+      })
+    : [];
+  const candidates = dedicated.length > 0 ? dedicated : personal.length > 0 ? personal : delegated;
+  const identitySource = dedicated.length > 0 ? "dedicated" as const : "personal" as const;
+  // Reconnecting can create another connection/grant for the same GitHub
+  // account. Ambiguity is about provider identities, not the number of rows.
+  // Only trust GitHub's stable account ID; equal logins or missing metadata
+  // cannot establish that two grants belong to the same person.
+  const githubUserIds = candidates.map((candidate) => candidate.providerTenant?.github?.userId?.trim());
+  if (candidates.length === 0 || (candidates.length > 1 && (
+    githubUserIds.some((id) => !id) || new Set(githubUserIds).size !== 1
+  ))) {
+    return {
+      configured: true, identitySource,
+      error: candidates.length === 0
+        ? "No managed GitHub identity is available for this run"
+        : "More than one managed GitHub identity matches this run",
+    };
+  }
+  const credentialIds = candidates.flatMap((grant) => grant.credentialSecretRefs
+    .filter((ref) => ref.configPath === "oauth.access_token").map((ref) => ref.secretId));
+  const credentialRecords = candidates.length > 1 && credentialIds.length > 0
+    ? await db.select({
+        id: companySecrets.id, status: companySecrets.status, deletedAt: companySecrets.deletedAt,
+        scope: companySecrets.scope, ownerUserId: companySecrets.ownerUserId,
+        definitionStatus: userSecretDefinitions.status, definitionDeletedAt: userSecretDefinitions.deletedAt,
+      }).from(companySecrets).leftJoin(userSecretDefinitions, and(
+        eq(userSecretDefinitions.id, companySecrets.userSecretDefinitionId),
+        eq(userSecretDefinitions.companyId, companyId),
+      )).where(and(
+        eq(companySecrets.companyId, companyId), inArray(companySecrets.id, credentialIds),
+      ))
+    : [];
+  const hasCredentialRecord = (grant: typeof connectionGrants.$inferSelect) => {
+    if (candidates.length === 1) return true;
+    const github = grant.providerTenant?.github;
+    const ref = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
+    return Boolean(github && github.installationCount > 0 && github.repositoryCount > 0 && ref
+      && credentialRecords.some((secret) => secret.id === ref.secretId
+        && secret.status === "active" && !secret.deletedAt
+        && (grant.kind === "user"
+          ? secret.scope === "user" && secret.ownerUserId === grant.subjectUserId
+            && secret.definitionStatus === "active" && !secret.definitionDeletedAt
+          : secret.scope === "company")));
+  };
+  const isAvailable = (grant: typeof connectionGrants.$inferSelect) =>
+    grant.status === "active" && hasCredentialRecord(grant) && githubConnections.some((connection) =>
+      connection.id === grant.connectionId && connection.enabled && connection.status === "active",
+    );
+  // Prefer an available, healthy authorization for this account, then the newest
+  // connection grant. Do not rank by updatedAt: refreshes/webhooks change it.
+  // Select one grant, preserving its credential and connection policy intact.
+  const healthRank = (candidate: typeof connectionGrants.$inferSelect) => {
+    const health = githubConnections.find((connection) => connection.id === candidate.connectionId)?.healthStatus;
+    return health === "ok" || health === "healthy" ? 2 : health === "unknown" ? 1 : 0;
+  };
+  const grant = candidates.filter((candidate) => candidate.id !== context.excludeGrantId).sort((a, b) =>
+    Number(isAvailable(b)) - Number(isAvailable(a))
+    || healthRank(b) - healthRank(a)
+    || b.createdAt.getTime() - a.createdAt.getTime()
+    || a.id.localeCompare(b.id),
+  )[0]!;
+  if (!grant) return { configured: true, identitySource, error: "No alternative managed GitHub authorization is available" };
+  const connection = githubConnections.find((candidate) => candidate.id === grant.connectionId);
+  if (!connection?.enabled || connection.status !== "active") {
+    return { configured: true, identitySource, error: "The managed GitHub connection is unavailable" };
+  }
+  if (grant.status !== "active") return { configured: true, identitySource, error: "The managed GitHub identity must be reconnected" };
+  return { configured: true, identitySource, grant };
+}
+
+export async function filterResolvedGitHubConnectionsForRun<T extends {
+  id: string;
+  config?: unknown;
+  transportConfig?: unknown;
+}>(input: {
+  db: Db;
+  companyId: string;
+  agentId: string;
+  responsibleUserId?: string | null;
+  connections: T[];
+}): Promise<T[]> {
+  const githubConnections = input.connections.filter((connection) => {
+    const config = connection.config && typeof connection.config === "object"
+      ? connection.config as Record<string, unknown>
+      : {};
+    const transportConfig = connection.transportConfig && typeof connection.transportConfig === "object"
+      ? connection.transportConfig as Record<string, unknown>
+      : {};
+    return config.sourceTemplateKey === "github" || transportConfig.sourceTemplateKey === "github";
+  });
+  if (githubConnections.length === 0) return input.connections;
+  const selection = await resolveManagedGitHubIdentitySelection(input.db, input.companyId, {
+    agentId: input.agentId,
+    responsibleUserId: input.responsibleUserId ?? null,
+  });
+  const selectedConnectionId = selection.grant?.connectionId ?? null;
+  const githubIds = new Set(githubConnections.map((connection) => connection.id));
+  return input.connections.filter((connection) =>
+    !githubIds.has(connection.id) || connection.id === selectedConnectionId,
+  );
+}
+
+export async function resolveManagedGitHubCredential(
+  db: Db,
+  secrets: GitCredentialSecretsDeps,
+  companyId: string,
+  context: {
+    issueId?: string | null;
+    heartbeatRunId?: string | null;
+    responsibleUserId?: string | null;
+    agentId?: string | null;
+    allowStandingDelegation?: boolean;
+  },
+): Promise<{ configured: boolean; identitySource?: "personal" | "dedicated"; credential?: GitCredential; error?: string }> {
+  const selection = await resolveManagedGitHubIdentitySelection(db, companyId, context);
+  if (!selection.configured) return { configured: false };
+  if (!selection.grant) return { configured: true, identitySource: selection.identitySource, error: selection.error };
+  const acquire = async (selection: Awaited<ReturnType<typeof resolveManagedGitHubIdentitySelection>>) => {
+    let grant = selection.grant!;
+    if (grant.kind === "user" && grant.subjectUserId) {
+      const [membership] = await db.select({ id: companyMemberships.id, role: companyMemberships.membershipRole }).from(companyMemberships).where(and(
+        eq(companyMemberships.companyId, companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, grant.subjectUserId),
+        eq(companyMemberships.status, "active"),
+      )).limit(1);
+      if (!membership || membership.role === "viewer") return { configured: true, identitySource: selection.identitySource, error: "The managed GitHub identity owner is not an authorized company member" };
+    }
+    const expiresAt = grant.providerTenant?.oauth?.accessTokenExpiresAt;
+    const refreshedAt = grant.providerTenant?.oauth?.refreshedAt;
+    const expiryMs = typeof expiresAt === "string" ? Date.parse(expiresAt) : Number.NaN;
+    const refreshedMs = typeof refreshedAt === "string" ? Date.parse(refreshedAt) : Number.NaN;
+    if (Number.isFinite(expiryMs) && (
+      expiryMs <= Date.now() + 60 * 60_000
+      || !Number.isFinite(refreshedMs)
+      || refreshedMs <= Date.now() - 30 * 24 * 60 * 60_000
+    )) {
+      grant = await toolAccessService(db).refreshOAuthGrantCredentials({
+        companyId,
+        connectionId: grant.connectionId,
+        grantId: grant.id,
+        actor: { actorType: "system", actorId: "workspace-git-credential" },
+        issueId: context.issueId,
+        heartbeatRunId: context.heartbeatRunId,
+      });
+    }
+    const accessRef = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
+    const github = grant.providerTenant?.github;
+    if (!accessRef || !github) return { configured: true, identitySource: selection.identitySource, error: "The managed GitHub identity is incomplete" };
+    if (github.installationCount < 1 || github.repositoryCount < 1) {
+      return { configured: true, identitySource: selection.identitySource, error: "The managed GitHub identity no longer has repository access" };
+    }
+    const accessContext = {
+      consumerType: "system" as const,
+      consumerId: "workspace-git-credential",
+      actorType: "system" as const,
+      actorId: context.agentId ?? undefined,
+      issueId: context.issueId ?? null,
+      heartbeatRunId: context.heartbeatRunId ?? null,
+      responsibleUserId: context.responsibleUserId ?? null,
+    };
+    let token: string;
+    if (grant.kind === "user") {
+      if (!grant.subjectUserId || !secrets.resolveUserSecretValue) {
+        return { configured: true, identitySource: selection.identitySource, error: "The personal GitHub credential cannot be resolved" };
+      }
+      const [secret] = await db.select({
+        userSecretDefinitionId: companySecrets.userSecretDefinitionId,
+      }).from(companySecrets).where(and(
+        eq(companySecrets.companyId, companyId),
+        eq(companySecrets.id, accessRef.secretId),
+        eq(companySecrets.ownerUserId, grant.subjectUserId),
+      )).limit(1);
+      if (!secret?.userSecretDefinitionId) return { configured: true, identitySource: selection.identitySource, error: "The personal GitHub credential is invalid" };
+      const resolved = await secrets.resolveUserSecretValue(companyId, {
+        definitionId: secret.userSecretDefinitionId,
+        responsibleUserId: grant.subjectUserId,
+        version: accessRef.versionSelector ?? "latest",
+        required: true,
+      }, accessContext);
+      if (!resolved) return { configured: true, identitySource: selection.identitySource, error: "The personal GitHub credential is missing" };
+      token = resolved.value;
+    } else {
+      token = await secrets.resolveSecretValue(companyId, accessRef.secretId, accessRef.versionSelector ?? "latest", { accessContext });
+    }
+    return {
+      configured: true, identitySource: selection.identitySource,
+      credential: {
+        token,
+        source: "managed_connection" as const,
+        secretName: null,
+        githubIdentity: { userId: github.userId, login: github.login },
+        identitySource: grant.kind === "agent" ? "dedicated" as const : "personal" as const,
+        connectionId: grant.connectionId,
+        grantId: grant.id,
+      },
+    };
+  };
+  let failure: { configured: boolean; identitySource?: "personal" | "dedicated"; error?: string };
+  try {
+    const result = await acquire(selection);
+    if (result.credential) return result;
+    failure = result;
+  } catch {
+    failure = { configured: true, identitySource: selection.identitySource, error: "GitHub credentials are temporarily unavailable" };
+  }
+  // Retry credential acquisition, never the GitHub operation. An alternate
+  // authorization must still belong to this exact principal and account.
+  const alternate = await resolveManagedGitHubIdentitySelection(db, companyId, {
+    ...context, excludeGrantId: selection.grant.id,
+  });
+  const accountId = selection.grant.providerTenant?.github?.userId;
+  if (!accountId || !alternate.grant || alternate.identitySource !== selection.identitySource
+    || alternate.grant.providerTenant?.github?.userId !== accountId
+    || alternate.grant.subjectUserId !== selection.grant.subjectUserId
+    || alternate.grant.subjectAgentId !== selection.grant.subjectAgentId) return failure;
+  try { return await acquire(alternate); } catch { return failure; }
 }

@@ -669,6 +669,58 @@ describe("LiveUpdatesProvider issue invalidation", () => {
     });
   });
 
+  it("actively refreshes interactions materialized by a visible native status decision", () => {
+    const invalidations: unknown[] = [];
+    const queryClient = {
+      invalidateQueries: (input: unknown) => {
+        invalidations.push(input);
+      },
+      getQueryData: (key: unknown) => {
+        if (JSON.stringify(key) === JSON.stringify(queryKeys.issues.detail("PAP-759"))) {
+          return {
+            id: "issue-1",
+            identifier: "PAP-759",
+            assigneeAgentId: "agent-1",
+          };
+        }
+        return undefined;
+      },
+    };
+
+    __liveUpdatesTestUtils.invalidateActivityQueries(
+      queryClient as never,
+      "company-1",
+      {
+        entityType: "issue",
+        entityId: "issue-1",
+        action: "issue.updated",
+        actorType: "system",
+        actorId: "native-status-committer",
+        details: {
+          identifier: "PAP-759",
+          source: "native_status_decision",
+          toStatus: "in_review",
+          reasonCode: "external_verification_required",
+          effectCount: 2,
+        },
+      },
+      { userId: null, agentId: null },
+      { pathname: "/PAP/issues/PAP-759", isForegrounded: true },
+    );
+
+    expect(invalidations).toContainEqual({
+      queryKey: queryKeys.issues.detail("issue-1"),
+      refetchType: "inactive",
+    });
+    expect(invalidations).toContainEqual({
+      queryKey: queryKeys.issues.interactions("issue-1"),
+    });
+    expect(invalidations).not.toContainEqual({
+      queryKey: queryKeys.issues.interactions("issue-1"),
+      refetchType: "inactive",
+    });
+  });
+
   it("keeps visible issue comment updates inactive-only instead of active refetching", () => {
     const invalidations: unknown[] = [];
     const queryClient = {
@@ -994,6 +1046,7 @@ describe("LiveUpdatesProvider visible issue toast suppression", () => {
   it("suppresses run and agent status toasts for the assignee of the visible issue", () => {
     const queryClient = {
       getQueryData: (key: unknown) => {
+        if (JSON.stringify(key) === JSON.stringify(queryKeys.issues.activeRun("PAP-759"))) return { id: "run-1" };
         if (JSON.stringify(key) === JSON.stringify(queryKeys.issues.detail("PAP-759"))) {
           return {
             id: "issue-1",
@@ -1345,5 +1398,32 @@ describe("dispatchLiveEventToSubscribers", () => {
       ),
     ).not.toThrow();
     expect(received).toEqual(["still-called"]);
+  });
+});
+
+describe("task subtree notification context", () => {
+  const root = { id: "root", companyId: "company", identifier: "PAP-204", assigneeAgentId: "parent-agent" };
+  const descendants = [{ id: "child", identifier: "PAP-205", assigneeAgentId: "child-agent", executionRunId: "child-run" }];
+  const queryClient = {
+    getQueryData: (key: unknown) => {
+      if (JSON.stringify(key) === JSON.stringify(queryKeys.issues.detail("PAP-204"))) return root;
+      if (JSON.stringify(key) === JSON.stringify(queryKeys.issues.listByDescendantRoot("company", "root"))) return descendants;
+    },
+  };
+  it("suppresses descendant cancellation and activity on the visible subtree", () => {
+    expect(__liveUpdatesTestUtils.shouldSuppressRunStatusToastForVisibleIssue(queryClient as never, "/PAP/issues/PAP-204", { runId: "child-run", agentId: "child-agent", status: "cancelled" }, { isForegrounded: true })).toBe(true);
+    expect(__liveUpdatesTestUtils.shouldSuppressActivityToastForVisibleIssue(queryClient as never, "/PAP/issues/PAP-204", { entityType: "issue", entityId: "child" }, { isForegrounded: true })).toBe(true);
+  });
+  it("uses the event task when a terminal run has already left the cache", () => {
+    expect(__liveUpdatesTestUtils.shouldSuppressRunStatusToastForVisibleIssue(queryClient as never, "/PAP/issues/PAP-204", { issueId: "root", runId: "finished-run" }, { isForegrounded: true })).toBe(true);
+    expect(__liveUpdatesTestUtils.shouldSuppressRunStatusToastForVisibleIssue(queryClient as never, "/PAP/issues/PAP-204", { issueId: "unrelated", runId: "child-run", agentId: "child-agent" }, { isForegrounded: true })).toBe(false);
+  });
+  it("retains notifications for unrelated tasks and background pages", () => {
+    for (const [agentId, foregrounded] of [["other-agent", true], ["child-agent", true], ["child-agent", false]] as const) {
+      expect(__liveUpdatesTestUtils.shouldSuppressRunStatusToastForVisibleIssue(queryClient as never, "/PAP/issues/PAP-204", { agentId, runId: "another-run", status: "cancelled" }, { isForegrounded: foregrounded })).toBe(false);
+    }
+  });
+  it("suppresses the run shown on its own run detail page", () => {
+    expect(__liveUpdatesTestUtils.shouldSuppressRunStatusToastForVisibleIssue(queryClient as never, "/PAP/agents/alex/runs/child-run", { runId: "child-run" }, { isForegrounded: true })).toBe(true);
   });
 });
