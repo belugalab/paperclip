@@ -12,6 +12,7 @@ overrides:
   react-dom: ^19.2.8
   '@codemirror/state': ^6.7.2
   '@codemirror/view': ^6.43.11
+  '@opentelemetry/api': ^1.9.0
 
 patchedDependencies:
   '@agentclientprotocol/claude-agent-acp@0.73.0':
@@ -6316,7 +6317,7 @@ packages:
       '@libsql/client-wasm': '>=0.10.0'
       '@neondatabase/serverless': '>=0.10.0'
       '@op-engineering/op-sqlite': '>=2'
-      '@opentelemetry/api': ^1.4.1
+      '@opentelemetry/api': ^1.9.0
       '@planetscale/database': '>=1.13'
       '@prisma/client': '*'
       '@tidbcloud/serverless': '*'
