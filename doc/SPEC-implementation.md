@@ -611,6 +611,33 @@ Every issue PATCH emits an `issue.updated` activity receipt containing the
 actor, responsible user, run, authorization reason, and field-level before/after
 changes so both agent and board edits are visible in the issue activity stream.
 
+### 9.3.2 Human company membership roles
+
+Human membership roles control principal permission grants, not company
+visibility. All company-visible work stays open to every active non-viewer
+member by default (create/read tasks, projects, and secrets; approve plans;
+wake or read agents; budgets and dashboard). Grants are applied on join and
+reconciled when a member's role changes through
+`PATCH /:companyId/members/:memberId` (role-default grants removed by the
+change are deleted; new role defaults are ensured).
+
+| Role | Default grants |
+|---|---|
+| owner | `agents:create`, `agents:configure`, `skills:create`, `environments:manage`, `users:invite`, `users:manage_permissions`, `tasks:assign`, `joins:approve`, `company:export` |
+| admin | `agents:create`, `agents:configure`, `skills:create`, `environments:manage`, `users:invite`, `tasks:assign`, `joins:approve`, `company:export` |
+| operator | `tasks:assign`, `company:export` |
+| contributor | `tasks:assign` |
+| viewer | (none) |
+
+`company:export` is the extract gate. The company export surfaces
+(`POST /:companyId/export`, `GET /:companyId/export/fidelity`,
+`POST /:companyId/exports/preview`, `POST /:companyId/exports`) require the
+grant for board users and stay CEO-agent-only for agents. `contributor` is the
+"use but do not extract" role: it carries no `company:export` grant and no
+agents, skills, invite, join-approval, or permission-management grants. Custom
+grants (permission keys outside the role default sets) are left untouched by
+role reconciliation.
+
 ## 9.4 Permission Terminology and Default Visibility Rule
 
 Paperclip V1 keeps a company-scoped visibility model as the default because centralized authorization and scoped work-object controls are not yet a core V1 control surface.

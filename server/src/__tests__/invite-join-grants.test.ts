@@ -75,6 +75,7 @@ describe("human invite roles", () => {
       { permissionKey: "users:manage_permissions", scope: null },
       { permissionKey: "tasks:assign", scope: null },
       { permissionKey: "joins:approve", scope: null },
+      { permissionKey: "company:export", scope: null },
     ]);
   });
 
@@ -87,7 +88,25 @@ describe("human invite roles", () => {
       { permissionKey: "users:invite", scope: null },
       { permissionKey: "tasks:assign", scope: null },
       { permissionKey: "joins:approve", scope: null },
+      { permissionKey: "company:export", scope: null },
     ]);
+  });
+
+  it("maps operator to tasks:assign and company:export", () => {
+    expect(grantsForHumanRole("operator")).toEqual([
+      { permissionKey: "tasks:assign", scope: null },
+      { permissionKey: "company:export", scope: null },
+    ]);
+  });
+
+  it("maps contributor to tasks:assign only", () => {
+    expect(grantsForHumanRole("contributor")).toEqual([
+      { permissionKey: "tasks:assign", scope: null },
+    ]);
+  });
+
+  it("maps viewer to no default grants", () => {
+    expect(grantsForHumanRole("viewer")).toEqual([]);
   });
 
   it("defaults legacy or missing roles to operator", () => {
@@ -108,6 +127,7 @@ describe("human invite roles", () => {
   it("falls back to role grants when human invite defaults omit explicit grants", () => {
     expect(humanJoinGrantsFromDefaults(null, "operator")).toEqual([
       { permissionKey: "tasks:assign", scope: null },
+      { permissionKey: "company:export", scope: null },
     ]);
   });
 

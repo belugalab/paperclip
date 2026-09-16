@@ -16,7 +16,11 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { accessService } from "../services/access.js";
 import { grantsForHumanRole } from "../services/company-member-roles.js";
-import { backfillPrincipalAccessCompatibility } from "../services/principal-access-compatibility.js";
+import {
+  backfillPrincipalAccessCompatibility,
+  ensureHumanRoleDefaultGrants,
+  reconcileRoleDefaultGrants,
+} from "../services/principal-access-compatibility.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -505,5 +509,132 @@ describeEmbeddedPostgres("access service", () => {
     expect(grants).toHaveLength(1);
     expect(grants[0]?.scope).toEqual(scopedGrant);
     expect(grants[0]?.grantedByUserId).toBe("custom-grant-author");
+  });
+
+  it("grants contributor use-only defaults without company:export", async () => {
+    const { company } = await createCompanyWithOwner(db);
+    const contributor = await db
+      .insert(companyMemberships)
+      .values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: `contributor-${randomUUID()}`,
+        status: "active",
+        membershipRole: "contributor",
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+
+    await ensureHumanRoleDefaultGrants(db, {
+      companyId: company.id,
+      principalId: contributor.principalId,
+      membershipRole: "contributor",
+      grantedByUserId: null,
+    });
+
+    const grantedKeys = (
+      await db
+        .select({ permissionKey: principalPermissionGrants.permissionKey })
+        .from(principalPermissionGrants)
+        .where(
+          and(
+            eq(principalPermissionGrants.companyId, company.id),
+            eq(principalPermissionGrants.principalId, contributor.principalId),
+          ),
+        )
+    ).map((row) => row.permissionKey);
+
+    expect(grantedKeys).toEqual(["tasks:assign"]);
+    await expect(
+      accessService(db).canUser(company.id, contributor.principalId, "tasks:assign"),
+    ).resolves.toBe(true);
+    await expect(
+      accessService(db).canUser(company.id, contributor.principalId, "company:export"),
+    ).resolves.toBe(false);
+  });
+
+  it("keeps company:export for operator and denies it for viewer", async () => {
+    const { company } = await createCompanyWithOwner(db);
+    const roles = ["operator", "viewer"] as const;
+    const members = await db
+      .insert(companyMemberships)
+      .values(
+        roles.map((role) => ({
+          companyId: company.id,
+          principalType: "user" as const,
+          principalId: `${role}-${randomUUID()}`,
+          status: "active" as const,
+          membershipRole: role,
+        })),
+      )
+      .returning();
+
+    for (const member of members) {
+      await ensureHumanRoleDefaultGrants(db, {
+        companyId: company.id,
+        principalId: member.principalId,
+        membershipRole: member.membershipRole,
+        grantedByUserId: null,
+      });
+    }
+
+    const operator = members.find((member) => member.membershipRole === "operator")!;
+    const viewer = members.find((member) => member.membershipRole === "viewer")!;
+    await expect(
+      accessService(db).canUser(company.id, operator.principalId, "company:export"),
+    ).resolves.toBe(true);
+    await expect(
+      accessService(db).canUser(company.id, viewer.principalId, "company:export"),
+    ).resolves.toBe(false);
+  });
+
+  it("reconciles role default grants on member role change without removing custom grants", async () => {
+    const { company } = await createCompanyWithOwner(db);
+    const member = await db
+      .insert(companyMemberships)
+      .values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: `operator-${randomUUID()}`,
+        status: "active",
+        membershipRole: "operator",
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+
+    const grants = [
+      ...grantsForHumanRole("operator"),
+      { permissionKey: "tools:use" as const, scope: null },
+    ];
+    await accessService(db).setPrincipalGrants(
+      company.id,
+      "user",
+      member.principalId,
+      grants,
+      null,
+    );
+
+    const removed = await reconcileRoleDefaultGrants(db, {
+      companyId: company.id,
+      principalId: member.principalId,
+      previousRole: "operator",
+      newRole: "contributor",
+    });
+    expect(removed).toBe(1);
+
+    const remaining = await accessService(db).listPrincipalGrants(
+      company.id,
+      "user",
+      member.principalId,
+    );
+    const remainingKeys = remaining.map((grant) => grant.permissionKey).sort();
+    expect(remainingKeys).toEqual(["tasks:assign", "tools:use"]);
+
+    await expect(
+      accessService(db).canUser(company.id, member.principalId, "company:export"),
+    ).resolves.toBe(false);
+    await expect(
+      accessService(db).canUser(company.id, member.principalId, "tasks:assign"),
+    ).resolves.toBe(true);
   });
 });

@@ -23,6 +23,7 @@ const mockAgentService = vi.hoisted(() => ({
 const mockAccessService = vi.hoisted(() => ({
   ensureMembership: vi.fn(),
   ensureRoleDefaultGrants: vi.fn(),
+  canUser: vi.fn().mockResolvedValue(true),
 }));
 
 const mockBudgetService = vi.hoisted(() => ({

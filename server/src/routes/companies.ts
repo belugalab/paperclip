@@ -353,6 +353,27 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
     }
   }
 
+  async function assertCanExportCompany(req: Request, companyId: string, capability: string) {
+    assertCompanyAccess(req, companyId);
+    if (req.actor.type === "board") {
+      if (req.actor.source === "local_implicit") return;
+      const allowed = await access.canUser(companyId, req.actor.userId, "company:export");
+      if (!allowed) {
+        throw forbidden(`Only roles with company export permission can manage ${capability}`);
+      }
+      return;
+    }
+    if (!req.actor.agentId) throw forbidden("Agent authentication required");
+
+    const actorAgent = await agents.getById(req.actor.agentId);
+    if (!actorAgent || actorAgent.companyId !== companyId) {
+      throw forbidden("Agent key cannot access another company");
+    }
+    if (actorAgent.role !== "ceo") {
+      throw forbidden(`Only CEO agents can manage ${capability}`);
+    }
+  }
+
   router.get("/", async (req, res) => {
     assertBoard(req);
     const result = await svc.list();
@@ -493,7 +514,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
 
   router.post("/:companyId/export", async (req, res) => {
     const companyId = req.params.companyId as string;
-    await assertSameCompanyCeoAgentOrBoard(req, companyId, "company exports");
+    await assertCanExportCompany(req, companyId, "company exports");
     const body = companyPortabilityExportSchema.parse(req.body);
     const result = await portability.exportBundle(companyId, body);
     res.json(result);
@@ -501,7 +522,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
 
   router.get("/:companyId/export/fidelity", async (req, res) => {
     const companyId = req.params.companyId as string;
-    await assertSameCompanyCeoAgentOrBoard(req, companyId, "company export fidelity");
+    await assertCanExportCompany(req, companyId, "company export fidelity");
     const counts = await collectExportFidelityCounts(db, companyId);
     res.json(buildExportFidelityReport(companyId, counts));
   });
@@ -1087,7 +1108,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
 
   router.post("/:companyId/exports/preview", async (req, res) => {
     const companyId = req.params.companyId as string;
-    await assertSameCompanyCeoAgentOrBoard(req, companyId, "company exports");
+    await assertCanExportCompany(req, companyId, "company exports");
     const body = companyPortabilityExportSchema.parse(req.body);
     const preview = await portability.previewExport(companyId, body);
     res.json(preview);
@@ -1095,7 +1116,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
 
   router.post("/:companyId/exports", async (req, res) => {
     const companyId = req.params.companyId as string;
-    await assertSameCompanyCeoAgentOrBoard(req, companyId, "company exports");
+    await assertCanExportCompany(req, companyId, "company exports");
     const body = companyPortabilityExportSchema.parse(req.body);
     const result = await portability.exportBundle(companyId, body);
     res.json(result);

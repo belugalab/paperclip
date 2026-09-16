@@ -24,7 +24,7 @@ type CompanySummary = {
 
 type CompanyMember = {
   id: string;
-  membershipRole: "owner" | "admin" | "operator" | "viewer";
+  membershipRole: "owner" | "admin" | "operator" | "contributor" | "viewer";
   status: "pending" | "active" | "suspended";
   user: { id: string; email: string | null; name: string | null } | null;
 };

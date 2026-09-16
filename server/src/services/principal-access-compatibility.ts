@@ -1,4 +1,4 @@
-import { and, eq, notInArray } from "drizzle-orm";
+import { and, eq, inArray, isNull, notInArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, companyMemberships, principalPermissionGrants } from "@paperclipai/db";
 import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
@@ -71,6 +71,47 @@ export async function ensureHumanRoleDefaultGrants(
     grants: grantsForHumanRole(role),
     grantedByUserId: input.grantedByUserId,
   });
+}
+
+export async function reconcileRoleDefaultGrants(
+  db: Db,
+  input: {
+    companyId: string;
+    principalId: string;
+    previousRole: string | null | undefined;
+    newRole: string | null | undefined;
+  },
+): Promise<number> {
+  const previous = normalizeHumanRole(input.previousRole, "operator");
+  const next = normalizeHumanRole(input.newRole, "operator");
+  if (previous === next) return 0;
+
+  const previousDefaults = grantsForHumanRole(previous);
+  const nextDefaultKeys = new Set(
+    grantsForHumanRole(next).map((grant) => grant.permissionKey),
+  );
+  const toRemove = previousDefaults.filter(
+    (grant) => !nextDefaultKeys.has(grant.permissionKey),
+  );
+  if (toRemove.length === 0) return 0;
+
+  const removed = await db
+    .delete(principalPermissionGrants)
+    .where(
+      and(
+        eq(principalPermissionGrants.companyId, input.companyId),
+        eq(principalPermissionGrants.principalType, "user"),
+        eq(principalPermissionGrants.principalId, input.principalId),
+        isNull(principalPermissionGrants.scope),
+        inArray(
+          principalPermissionGrants.permissionKey,
+          toRemove.map((grant) => grant.permissionKey),
+        ),
+      ),
+    )
+    .returning({ id: principalPermissionGrants.id });
+
+  return removed.length;
 }
 
 export async function backfillPrincipalAccessCompatibility(

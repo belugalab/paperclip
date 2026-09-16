@@ -18,6 +18,7 @@ const mockAgentService = vi.hoisted(() => ({
 
 const mockAccessService = vi.hoisted(() => ({
   ensureMembership: vi.fn(),
+  canUser: vi.fn().mockResolvedValue(true),
 }));
 
 const mockBudgetService = vi.hoisted(() => ({
@@ -477,6 +478,58 @@ describe.sequential("company portability routes", () => {
       expect(res.body.rootPath).toBe("paperclip");
     }
     expect(mockCompanyPortabilityService.exportBundle).toHaveBeenCalledTimes(2);
+  });
+
+  it.sequential("rejects board members without company:export from all export surfaces", async () => {
+    vi.mocked(mockAccessService.canUser).mockResolvedValueOnce(false).mockResolvedValueOnce(false).mockResolvedValueOnce(false).mockResolvedValueOnce(false);
+    const app = await createApp({
+      type: "board",
+      userId: "contributor-user",
+      companyIds: [companyId],
+      source: "session",
+      isInstanceAdmin: false,
+    });
+
+    const previews = await request(app)
+      .post(`/api/companies/${companyId}/exports/preview`)
+      .send(exportRequest);
+    const fidelity = await request(app)
+      .get(`/api/companies/${companyId}/export/fidelity`);
+    const legacy = await request(app)
+      .post(`/api/companies/${companyId}/export`)
+      .send(exportRequest);
+    const ceoSafe = await request(app)
+      .post(`/api/companies/${companyId}/exports`)
+      .send(exportRequest);
+
+    expect(previews.status).toBe(403);
+    expect(fidelity.status).toBe(403);
+    expect(legacy.status).toBe(403);
+    expect(ceoSafe.status).toBe(403);
+    expect(mockAccessService.canUser).toHaveBeenCalledWith(companyId, "contributor-user", "company:export");
+    expect(mockCompanyPortabilityService.exportBundle).not.toHaveBeenCalled();
+    expect(mockCompanyPortabilityService.previewExport).not.toHaveBeenCalled();
+  });
+
+  it.sequential("allows local implicit board actors to export without a company:export grant check", async () => {
+    mockCompanyPortabilityService.exportBundle.mockResolvedValue(createExportResult());
+    vi.mocked(mockAccessService.canUser).mockRejectedValue(
+      new Error("canUser must not be called for local implicit actors"),
+    );
+    const app = await createApp({
+      type: "board",
+      userId: "local-user",
+      companyIds: [companyId],
+      source: "local_implicit",
+      isInstanceAdmin: false,
+    });
+
+    const res = await request(app).post(`/api/companies/${companyId}/exports`).send(exportRequest);
+
+    expect(res.status).toBe(200);
+    expect(res.body.rootPath).toBe("paperclip");
+    expect(mockAccessService.canUser).not.toHaveBeenCalled();
+    vi.mocked(mockAccessService.canUser).mockResolvedValue(true);
   });
 
   it.sequential("rejects CEO agents from exporting another company before services run", async () => {

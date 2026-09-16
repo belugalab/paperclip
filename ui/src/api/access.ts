@@ -1,7 +1,7 @@
 import type { AgentAdapterType, JoinRequest, PermissionKey } from "@paperclipai/shared";
 import { api } from "./client";
 
-export type HumanCompanyRole = "owner" | "admin" | "operator" | "viewer";
+export type HumanCompanyRole = "owner" | "admin" | "operator" | "contributor" | "viewer";
 
 type InviteSummary = {
   id: string;

@@ -94,6 +94,10 @@ import {
 } from "../services/company-member-roles.js";
 import { humanJoinGrantsFromDefaults } from "../services/invite-grants.js";
 import {
+  ensureHumanRoleDefaultGrants,
+  reconcileRoleDefaultGrants,
+} from "../services/principal-access-compatibility.js";
+import {
   collapseDuplicatePendingHumanJoinRequests,
   findReusableHumanJoinRequest,
 } from "../lib/join-request-dedupe.js";
@@ -1260,6 +1264,7 @@ type CompanyMemberRecord = Awaited<ReturnType<typeof loadCompanyMemberRecords>>[
 const humanRoleRank: Record<HumanCompanyMembershipRole, number> = {
   viewer: 1,
   operator: 2,
+  contributor: 2,
   admin: 3,
   owner: 4,
 };
@@ -2066,7 +2071,7 @@ function extractInviteMessage(
 function mergeInviteDefaults(
   defaultsPayload: Record<string, unknown> | null | undefined,
   agentMessage: string | null,
-  humanRole: "owner" | "admin" | "operator" | "viewer" | null = null,
+  humanRole: "owner" | "admin" | "operator" | "contributor" | "viewer" | null = null,
 ): Record<string, unknown> | null {
   const merged =
     defaultsPayload && typeof defaultsPayload === "object"
@@ -3058,7 +3063,7 @@ export function accessRoutes(
     req: Request;
     companyId: string;
     allowedJoinTypes: "human" | "agent" | "both";
-    humanRole?: "owner" | "admin" | "operator" | "viewer" | null;
+    humanRole?: "owner" | "admin" | "operator" | "contributor" | "viewer" | null;
     defaultsPayload?: Record<string, unknown> | null;
     agentMessage?: string | null;
   }) {
@@ -4555,6 +4560,19 @@ export function accessRoutes(
           .then((rows) => rows[0] ?? existing);
       });
       if (!updated) throw notFound("Member not found");
+
+      await reconcileRoleDefaultGrants(db, {
+        companyId,
+        principalId: updated.principalId,
+        previousRole: memberToUpdate.membershipRole,
+        newRole: updated.membershipRole,
+      });
+      await ensureHumanRoleDefaultGrants(db, {
+        companyId,
+        principalId: updated.principalId,
+        membershipRole: updated.membershipRole,
+        grantedByUserId: req.actor.userId ?? null,
+      });
 
       await logActivity(db, {
         companyId,

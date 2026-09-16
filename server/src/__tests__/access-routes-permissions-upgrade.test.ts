@@ -117,7 +117,7 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
     expect(unchanged.membershipRole).toBe("owner");
   }, 10_000);
 
-  it("keeps custom grants when the role-only member route changes a member role", async () => {
+  it("reconciles role default grants and keeps custom grants when the role-only member route changes a member role", async () => {
     const { company, owner } = await createCompanyWithOwner(db);
     const member = await db
       .insert(companyMemberships)
@@ -157,11 +157,20 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
           eq(principalPermissionGrants.principalId, member.principalId),
         ),
       );
-    expect(grants).toHaveLength(1);
-    expect(grants[0]).toMatchObject({
-      permissionKey: "tasks:assign_scope",
+    expect(grants.map((grant) => grant.permissionKey).sort()).toEqual([
+      "company:export",
+      "tasks:assign",
+      "tasks:assign_scope",
+    ]);
+    const custom = grants.find((grant) => grant.permissionKey === "tasks:assign_scope");
+    expect(custom).toMatchObject({
       scope: customScope,
       grantedByUserId: owner.principalId,
     });
+    for (const grant of grants) {
+      if (grant.permissionKey !== "tasks:assign_scope") {
+        expect(grant.scope).toBeNull();
+      }
+    }
   });
 });

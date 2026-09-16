@@ -964,6 +964,7 @@ export const COMPANY_MEMBERSHIP_ROLES = [
   "owner",
   "admin",
   "operator",
+  "contributor",
   "viewer",
   "member",
 ] as const;
@@ -973,6 +974,7 @@ export const HUMAN_COMPANY_MEMBERSHIP_ROLES = [
   "owner",
   "admin",
   "operator",
+  "contributor",
   "viewer",
 ] as const;
 export type HumanCompanyMembershipRole = (typeof HUMAN_COMPANY_MEMBERSHIP_ROLES)[number];
@@ -981,6 +983,7 @@ export const HUMAN_COMPANY_MEMBERSHIP_ROLE_LABELS: Record<HumanCompanyMembership
   owner: "Owner",
   admin: "Admin",
   operator: "Operator",
+  contributor: "Contributor",
   viewer: "Viewer",
 };
 
@@ -1021,6 +1024,7 @@ export const PERMISSION_KEYS = [
   "tasks:manage_active_checkouts",
   "pipelines:write",
   "joins:approve",
+  "company:export",
 ] as const;
 export type PermissionKey = (typeof PERMISSION_KEYS)[number];
 
