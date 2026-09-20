@@ -21,6 +21,87 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+// ---------------------------------------------------------------------------
+// OmniRoute dynamic provider auto-generation
+// ---------------------------------------------------------------------------
+
+const OMNIRoute_PROVIDER_CACHE_TTL_MS = 60_000;
+let omniRouteProviderCache: {
+  baseUrl: string;
+  apiKey: string;
+  provider: Record<string, unknown>;
+  expiresAt: number;
+} | null = null;
+
+/**
+ * When `OPENROUTER_BASE_URL` is set and no explicit `PAPERCLIP_OPENCODE_PROVIDERS`
+ * is configured, auto-generate the OmniRoute OpenCode provider by fetching the
+ * live model catalog from `${baseUrl}/models`.  This eliminates the need to maintain
+ * a static model list in the env var.
+ *
+ * Returns `null` when the env var is unset, the fetch fails, or no models are found.
+ */
+async function buildOmniRouteProviderFromEnv(
+  resolveEnv: (name: string) => string | undefined,
+): Promise<Record<string, unknown> | null> {
+  const baseUrl = resolveEnv("OPENROUTER_BASE_URL")?.trim();
+  if (!baseUrl) return null;
+  const apiKey = resolveEnv("OPENROUTER_API_KEY")?.trim() ?? "";
+  const now = Date.now();
+  if (
+    omniRouteProviderCache &&
+    omniRouteProviderCache.baseUrl === baseUrl &&
+    omniRouteProviderCache.apiKey === apiKey &&
+    omniRouteProviderCache.expiresAt > now
+  ) {
+    return omniRouteProviderCache.provider;
+  }
+
+  try {
+    const res = await fetch(`${baseUrl}/models`, {
+      headers: {
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        "Content-Type": "application/json",
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return null;
+
+    const data = (await res.json()) as {
+      data: Array<{ id: string; name?: string; type?: string }>;
+    };
+
+    const models: Record<string, { name: string }> = {};
+    for (const m of data.data ?? []) {
+      if (m.type === "video") continue;
+      models[m.id] = { name: m.name || m.id };
+    }
+
+    if (Object.keys(models).length === 0) return null;
+
+    const provider: Record<string, unknown> = {
+      npm: "@ai-sdk/openai-compatible",
+      name: "OmniRoute",
+      options: { baseURL: baseUrl, apiKey },
+      models,
+    };
+
+    omniRouteProviderCache = {
+      baseUrl,
+      apiKey,
+      provider,
+      expiresAt: now + OMNIRoute_PROVIDER_CACHE_TTL_MS,
+    };
+    return provider;
+  } catch {
+    return null;
+  }
+}
+
+export function resetOmniRouteProviderCacheForTests() {
+  omniRouteProviderCache = null;
+}
+
 // Recursively replace {env:VAR} placeholders with the resolved value. Used to bake
 // gateway provider secrets (e.g. the LLM-gateway virtual key) into opencode.json
 // SERVER-SIDE, where the value is reliably present. OpenCode's own {env:...}
@@ -164,18 +245,38 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   // custom provider with an explicit models map. We accept it as config (not
   // hard-coded) so the gateway URL, key env, and model list stay declarative.
   const resolveEnv = (name: string): string | undefined => input.env[name] ?? process.env[name];
-  const gatewayProviders = parseProviderConfig(
+  let gatewayProviders = parseProviderConfig(
     input.env.PAPERCLIP_OPENCODE_PROVIDERS ?? process.env.PAPERCLIP_OPENCODE_PROVIDERS,
     resolveEnv,
     notes,
   );
+
+  // Auto-generate OmniRoute provider from OPENROUTER_BASE_URL when no explicit
+  // PAPERCLIP_OPENCODE_PROVIDERS is set.  This eliminates the need to maintain
+  // a static model list in the env var.
+  if (!gatewayProviders) {
+    const omniRouteProvider = await buildOmniRouteProviderFromEnv(resolveEnv);
+    if (omniRouteProvider) {
+      const modelCount = Object.keys(
+        (omniRouteProvider.models as Record<string, unknown>) ?? {},
+      ).length;
+      gatewayProviders = { omniroute: omniRouteProvider };
+      notes.push(
+        `Auto-generated OmniRoute provider from OPENROUTER_BASE_URL with ${modelCount} model(s).`,
+      );
+    }
+  }
+
   const existingProvider = isPlainObject(existingConfig.provider) ? existingConfig.provider : {};
   let nextProvider = gatewayProviders
     ? { ...existingProvider, ...gatewayProviders }
     : existingProvider;
   if (gatewayProviders) {
+    const source = input.env.PAPERCLIP_OPENCODE_PROVIDERS ?? process.env.PAPERCLIP_OPENCODE_PROVIDERS
+      ? "PAPERCLIP_OPENCODE_PROVIDERS"
+      : "OPENROUTER_BASE_URL";
     notes.push(
-      `Injected ${Object.keys(gatewayProviders).length} custom OpenCode provider(s) from PAPERCLIP_OPENCODE_PROVIDERS: ${Object.keys(gatewayProviders).join(", ")}.`,
+      `Injected ${Object.keys(gatewayProviders).length} custom OpenCode provider(s) from ${source}: ${Object.keys(gatewayProviders).join(", ")}.`,
     );
   }
 
