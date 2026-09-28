@@ -852,6 +852,44 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
+// Parses PAPERCLIP_ADAPTER_CONCURRENCY_LIMITS, an optional JSON object mapping
+// adapter type -> a positive integer cap on how many runs using that adapter
+// type may be "running" at once across the whole instance, e.g.
+// '{"opencode":5,"litellm":10}'. Unset, unparsable, or non-object input yields
+// {} (no limits), which is the default: the feature is opt-in and changes no
+// behavior for anyone who has not set it. Non-finite or non-positive entries
+// are dropped rather than treated as "no limit" or "zero forever", so a typo
+// degrades to "that adapter type is unthrottled" instead of silently wedging
+// every run using it.
+export function resolveAdapterConcurrencyLimits(
+  env: Record<string, string | undefined> = process.env,
+): Record<string, number> {
+  const raw = env.PAPERCLIP_ADAPTER_CONCURRENCY_LIMITS;
+  if (!raw || !raw.trim()) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return {};
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return {};
+  }
+  const limits: Record<string, number> = {};
+  for (const [adapterType, value] of Object.entries(
+    parsed as Record<string, unknown>,
+  )) {
+    const parsedValue = typeof value === "number" ? value : Number(value);
+    // >= 1, not > 0: a value that floors to zero (e.g. 0.5) would otherwise
+    // pass this check and then cap the adapter type at zero, leaving every
+    // run for it queued forever with no running run to ever free a "slot".
+    if (Number.isFinite(parsedValue) && parsedValue >= 1) {
+      limits[adapterType] = Math.floor(parsedValue);
+    }
+  }
+  return limits;
+}
+
 export function heartbeatService(
   db: Db,
   options: HeartbeatServiceOptions = {},
@@ -960,6 +998,26 @@ export function heartbeatService(
       allowWorktreeRunExecution: override.allowed,
     });
   };
+  // Empty unless PAPERCLIP_ADAPTER_CONCURRENCY_LIMITS is set (see
+  // resolveAdapterConcurrencyLimits above); an empty map disables every
+  // check in the queue module at negligible cost, so this feature is a no-op
+  // by default.
+  const adapterConcurrencyLimits = resolveAdapterConcurrencyLimits(runtimeEnv);
+  if (Object.keys(adapterConcurrencyLimits).length > 0) {
+    // claimRunsWithAdapterConcurrencyGuard holds one pooled connection for its
+    // lock/count transaction and needs at least one more free for
+    // claimQueuedRun's own work while that transaction is open. A
+    // single-connection pool would make every guarded wake wait on itself.
+    const poolMax = Number(runtimeEnv.DATABASE_POOL_MAX);
+    if (Number.isFinite(poolMax) && poolMax === 1) {
+      logger.warn(
+        { poolMax },
+        "PAPERCLIP_ADAPTER_CONCURRENCY_LIMITS is set but DATABASE_POOL_MAX=1; " +
+          "this combination can stall queued run admission indefinitely for " +
+          "the throttled adapter type(s). Set DATABASE_POOL_MAX to 2 or more.",
+      );
+    }
+  }
   const getWorktreeExecutionCutoff = async () => {
     const override = await resolveWorktreeRunExecutionOverride();
     return override.allowed ? override.cutoff : null;
@@ -1345,6 +1403,7 @@ export function heartbeatService(
     isSameTaskScope,
     runTaskKey,
     filterZombieCoalesceTarget,
+    adapterConcurrencyLimits,
   });
 
   const {
