@@ -1,4 +1,14 @@
-import type { Db } from "@paperclipai/db";
+import {
+  companyMemberships,
+  companySecrets,
+  connectionGrantDelegations,
+  connectionGrants,
+  toolConnectionInstalls,
+  toolConnections,
+  userSecretDefinitions,
+  type Db,
+} from "@paperclipai/db";
+import { and, eq, inArray, or } from "drizzle-orm";
 import { secretService } from "./secrets.js";
 import { toolAccessService } from "./tool-access.js";
 
@@ -62,6 +72,23 @@ type GitHostProviderConfig = {
    * the module doc comment for why). Undefined for a provider with no self-hosted mode.
    */
   selfHostedCaCertEnvName?: string;
+  /**
+   * Whether this provider's SSH remotes are rewritten to HTTPS for the matched invocation, so a
+   * repository cloned over `git@host:owner/repo.git` uses the resolved token instead of failing on
+   * an absent SSH key. When set, `buildGitAuthInvocation` adds `url.<https primary>/.insteadOf`
+   * entries for every host the matched invocation resolves to, in both scp-style and `ssh://`
+   * form. Only the provider's static SaaS hosts are matched (see `resolveSshGitHostProvider`) —
+   * a self-managed instance's SSH remote keeps falling through to ambient git, because its host
+   * comes from operator config and git's SSH port is a per-instance choice no caller declares.
+   */
+  sshToHttpsRewrite?: boolean;
+  /**
+   * Env var names the token is *also* exported under for this provider's own CLIs (`gh` reads
+   * `GH_TOKEN`/`GITHUB_TOKEN`), in addition to the `PAPERCLIP_GIT_TOKEN` the credential helper
+   * reads. Process-scoped to the one git invocation, never the server's own environment.
+   * Undefined for a provider with no CLI convention to satisfy.
+   */
+  tokenPassthroughEnvNames?: readonly string[];
 };
 
 /** Company-secret names probed for a GitHub token, in priority order. */
@@ -84,6 +111,8 @@ const GIT_HOST_PROVIDERS: readonly GitHostProviderConfig[] = [
     tokenUsername: "x-access-token",
     secretNames: DEFAULT_GITHUB_TOKEN_SECRET_NAMES,
     envNames: ["GITHUB_TOKEN", "GH_TOKEN"],
+    sshToHttpsRewrite: true,
+    tokenPassthroughEnvNames: ["GH_TOKEN", "GITHUB_TOKEN"],
   },
   {
     id: "gitlab",
@@ -97,6 +126,8 @@ const GIT_HOST_PROVIDERS: readonly GitHostProviderConfig[] = [
     envNames: ["GITLAB_TOKEN"],
     selfHostedEnvName: "PAPERCLIP_GITLAB_HOSTS",
     selfHostedCaCertEnvName: "PAPERCLIP_GITLAB_CA_CERT_PATH",
+    sshToHttpsRewrite: true,
+    tokenPassthroughEnvNames: ["GITLAB_TOKEN"],
   },
 ];
 
@@ -170,6 +201,44 @@ function resolveGitHostProvider(remoteUrl: string): GitHostProviderConfig | null
 }
 
 /**
+ * Match an SSH remote (`git@github.com:owner/repo.git` or `ssh://git@github.com/owner/repo.git`)
+ * to the provider whose hosts it names, for the providers that declare `sshToHttpsRewrite`.
+ *
+ * Both spellings are accepted because git accepts both in a remote, and `buildGitAuthInvocation`
+ * emits an `insteadOf` entry for each: a caller that resolves a credential for one spelling gets
+ * a rewrite for it. Scp-style remotes are matched by regex rather than `new URL()` — `git@host:path`
+ * is not a parseable URL, and `ssh://` URLs carry the user in `username` (the literal `git`, which
+ * is git's own convention and not an operator-supplied credential).
+ *
+ * Returns null for a host no rewrite-enabled provider names, so an SSH remote for an unknown or
+ * self-managed host still falls through to ambient git behavior rather than being redirected.
+ */
+function resolveSshGitHostProvider(remoteUrl: string): GitHostProviderConfig | null {
+  const scpMatch = /^git@([^:]+):(.+)$/.exec(remoteUrl.trim());
+  let hostname: string;
+  if (scpMatch) {
+    hostname = scpMatch[1].toLowerCase();
+  } else {
+    let parsed: URL;
+    try {
+      parsed = new URL(remoteUrl);
+    } catch {
+      return null;
+    }
+    if (parsed.protocol !== "ssh:" || parsed.password) return null;
+    // git's SSH convention is the literal user `git`; anything else is an operator-supplied
+    // credential this module must never override.
+    if (parsed.username && parsed.username !== "git") return null;
+    hostname = parsed.hostname.toLowerCase();
+  }
+  return (
+    GIT_HOST_PROVIDERS.find(
+      (provider) => provider.sshToHttpsRewrite && provider.hosts.includes(hostname),
+    ) ?? null
+  );
+}
+
+/**
  * The full match used by real credential resolution: static SaaS hosts first, then each
  * provider's operator-configured self-hosted hosts (env-driven, see `selfHostedEnvName`).
  * `scopedHosts` is what the credential helper gets installed for — the provider's whole SaaS
@@ -185,6 +254,12 @@ function resolveGitHostMatch(
 ): { provider: GitHostProviderConfig; scopedHosts: readonly string[]; selfHosted: boolean } | null {
   const staticProvider = resolveGitHostProvider(remoteUrl);
   if (staticProvider) return { provider: staticProvider, scopedHosts: staticProvider.hosts, selfHosted: false };
+
+  // An SSH remote for a rewrite-enabled provider's host resolves here, so the invocation can
+  // carry both the token and the `insteadOf` entries that turn the SSH remote into the HTTPS
+  // request the credential helper answers.
+  const sshProvider = resolveSshGitHostProvider(remoteUrl);
+  if (sshProvider) return { provider: sshProvider, scopedHosts: sshProvider.hosts, selfHosted: false };
 
   let parsed: URL;
   try {
@@ -263,6 +338,20 @@ export type GitCredential = {
   secretName: string | null;
   /** Which host provider this token authenticates against. */
   providerId: GitProviderId;
+  /**
+   * The managed GitHub identity behind this credential, when one resolved. Only GitHub
+   * connections carry an identity — a GitLab token has no equivalent, so it stays undefined
+   * there. Callers that attribute work to a responsible person's account (see
+   * `github-operation-credentials.ts`) read it; `buildGitAuthInvocation` turns it into
+   * `user.name`/`user.email` git config.
+   */
+  githubIdentity?: { userId: string; login: string };
+  /** Whether the credential came from the responsible person or a dedicated connection. */
+  identitySource?: "personal" | "dedicated";
+  /** The managed connection this credential was brokered from, when brokered. */
+  connectionId?: string;
+  /** The grant that authorized the brokered connection, when brokered. */
+  grantId?: string;
 };
 
 /** A prepared, credential-bearing git invocation: config args plus the env that carries the token. */
@@ -333,10 +422,44 @@ export function buildGitAuthInvocation(
   for (const host of hosts) {
     configArgs.push("-c", `credential.https://${host}.helper=${helperScript}`);
   }
+  // A repo cloned over SSH (`git@github.com:owner/repo.git`) has no HTTPS credential request to
+  // answer, so without this rewrite the invocation carries a token git never asks for and the
+  // clone fails on a missing SSH key instead. Rewrite every SSH form of every resolved host to
+  // the provider's primary HTTPS host: git applies `insteadOf` before resolving credentials, so
+  // the resulting HTTPS request hits the URL-scoped helper installed above. Scoped to this one
+  // invocation's `-c` args, never written to a repo's or the user's git config.
+  const identity = credential.githubIdentity;
+  if (provider.sshToHttpsRewrite) {
+    const primary = hosts[0];
+    const sshForms = hosts.flatMap((host) => [`git@${host}:`, `ssh://git@${host}/`]);
+    for (const form of sshForms) {
+      configArgs.push("-c", `url.https://${primary}/.insteadOf=${form}`);
+    }
+  }
+  // Commit as the responsible person rather than as whatever account the runner's global git
+  // config happens to name, so an agent's commits are attributable. GitHub's `user.noreply`
+  // form keeps the commit linked to the account without exposing its real email address.
+  if (identity) {
+    const noreplyEmail = `${identity.userId}+${identity.login}@users.noreply.github.com`;
+    configArgs.push("-c", `user.name=${identity.login}`, "-c", `user.email=${noreplyEmail}`);
+  }
   const env: Record<string, string> = {
     [GIT_CREDENTIAL_TOKEN_ENV_KEY]: credential.token,
     GIT_TERMINAL_PROMPT: "0",
   };
+  // Also export the token under the provider's own CLI env names, so a `gh`/`glab` invocation
+  // inside the same process authenticates with the same resolved credential. Scoped to this
+  // invocation's env; the server's own environment is untouched.
+  for (const name of provider.tokenPassthroughEnvNames ?? []) {
+    env[name] = credential.token;
+  }
+  if (identity) {
+    const noreplyEmail = `${identity.userId}+${identity.login}@users.noreply.github.com`;
+    env.GIT_AUTHOR_NAME = identity.login;
+    env.GIT_AUTHOR_EMAIL = noreplyEmail;
+    env.GIT_COMMITTER_NAME = identity.login;
+    env.GIT_COMMITTER_EMAIL = noreplyEmail;
+  }
   if (caCertPath) {
     env.GIT_SSL_CAINFO = caCertPath;
   }
@@ -732,6 +855,7 @@ export async function resolveManagedGitHubCredential(
         token,
         source: "managed_connection" as const,
         secretName: null,
+        providerId: "github" as const,
         githubIdentity: { userId: github.userId, login: github.login },
         identitySource: grant.kind === "agent" ? "dedicated" as const : "personal" as const,
         connectionId: grant.connectionId,
