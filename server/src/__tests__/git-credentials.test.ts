@@ -111,19 +111,30 @@ describe("createGitRemoteAuthProvider", () => {
       env: {},
     });
     const invocation = await provider("git@github.com:example/repo.git");
-    expect(invocation?.env.GIT_CONFIG_VALUE_3).toBe("git@github.com:");
-    expect(invocation?.env.GIT_CONFIG_KEY_3).toBe("url.https://github.com/.insteadOf");
+    expect(invocation).not.toBeNull();
+    const joined = invocation!.configArgs.join(" ");
+    // Scp-style and ssh:// spellings of every provider host both rewrite to the primary host.
+    for (const form of [
+      "git@github.com:",
+      "ssh://git@github.com/",
+      "git@www.github.com:",
+      "ssh://git@www.github.com/",
+    ]) {
+      expect(joined).toContain(`url.https://github.com/.insteadOf=${form}`);
+    }
   });
 
-  it("returns null for non-GitHub URLs without touching the secret store", async () => {
+  it("returns null for out-of-scope URLs without touching the secret store", async () => {
     const secrets = buildSecretsFake({ GITHUB_TOKEN: "token" });
     const provider = createGitRemoteAuthProvider(fakeDb, "company-1", undefined, {
       secrets,
       env: {},
     });
-    await expect(provider("git@github.com:example/repo.git")).resolves.toBeNull();
+    // gitlab.com now has its own provider, so it is exercised by the GitLab block below; the
+    // SSH case here is an SSH remote for a host no rewrite-enabled provider names.
+    await expect(provider("git@bitbucket.org:example/repo.git")).resolves.toBeNull();
     await expect(provider("https://bitbucket.org/example/repo.git")).resolves.toBeNull();
-    await expect(provider("https://gitlab.internal.example/example/repo.git")).resolves.toBeNull();
+    await expect(provider("ssh://git@gitlab.internal.example/example/repo.git")).resolves.toBeNull();
     expect(secrets.getByName).not.toHaveBeenCalled();
   });
 
@@ -199,6 +210,30 @@ describe("createGitRemoteAuthProvider", () => {
       expect(invocation?.source).toBe("server_env");
       expect(invocation?.secretName).toBeNull();
       expect(invocation?.providerId).toBe("gitlab");
+    });
+
+    it("accepts GitLab SSH remotes for process-scoped HTTPS rewriting", async () => {
+      const secrets = buildSecretsFake({ GITLAB_TOKEN: "glpat-token" });
+      const provider = createGitRemoteAuthProvider(fakeDb, "company-1", undefined, {
+        secrets,
+        env: {},
+      });
+      for (const remote of ["git@gitlab.com:example/repo.git", "ssh://git@gitlab.com/example/repo.git"]) {
+        const invocation = await provider(remote);
+        expect(invocation).not.toBeNull();
+        expect(invocation?.providerId).toBe("gitlab");
+        expect(invocation?.secretName).toBe("GITLAB_TOKEN");
+        const joined = invocation!.configArgs.join(" ");
+        for (const form of [
+          "git@gitlab.com:",
+          "ssh://git@gitlab.com/",
+          "git@www.gitlab.com:",
+          "ssh://git@www.gitlab.com/",
+        ]) {
+          expect(joined).toContain(`url.https://gitlab.com/.insteadOf=${form}`);
+        }
+        expect(joined).toContain("credential.https://gitlab.com.helper=");
+      }
     });
 
     it("never probes GitHub secret names for a GitLab remote, and vice versa", async () => {
@@ -479,6 +514,7 @@ describe("buildGitAuthInvocation", () => {
     expect(invocation.configArgs[3]).toContain("oauth2");
     expect(invocation.configArgs[5]).toContain("credential.https://www.gitlab.com.helper=");
     expect(invocation.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("super-secret-token");
+    expect(invocation.env.GITLAB_TOKEN).toBe("super-secret-token");
     expect(invocation.providerId).toBe("gitlab");
   });
 
