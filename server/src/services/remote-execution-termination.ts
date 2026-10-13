@@ -7,16 +7,24 @@ type LeaseIdentity = {
 };
 
 /** Bind a provider receipt to the exact host-owned lease and run. Old plugins
- * return void; that remains supported but grants no continuation authority. */
+ * return void; that remains supported but grants no continuation authority.
+ * The flat `state` is the canonical termination receipt; a provider that
+ * returns the richer `PluginEnvironmentReleaseLeaseResult` may carry the state
+ * only in `metadata.state`, so fall back to it when the flat field is absent. */
 export function remoteTerminationReceipt(lease: LeaseIdentity, value: unknown) {
-  const receipt = value as { providerLeaseId?: unknown; state?: unknown } | null;
+  const receipt = value as {
+    providerLeaseId?: unknown;
+    state?: unknown;
+    metadata?: { state?: unknown } | null;
+  } | null;
+  const state = receipt?.state ?? receipt?.metadata?.state;
   if (!lease.heartbeatRunId || !lease.provider || lease.provider === "local" ||
       !lease.providerLeaseId || receipt?.providerLeaseId !== lease.providerLeaseId ||
-      !["stopped", "destroyed"].includes(String(receipt?.state))) return undefined;
+      !["stopped", "destroyed"].includes(String(state))) return undefined;
   return {
     schema: "paperclip.remote-termination.v1", companyId: lease.companyId,
     runId: lease.heartbeatRunId, leaseId: lease.id, provider: lease.provider,
-    providerLeaseId: lease.providerLeaseId, state: receipt!.state,
+    providerLeaseId: lease.providerLeaseId, state,
     confirmedAt: new Date().toISOString(),
   };
 }
