@@ -75,6 +75,7 @@ import type {
   PluginEnvironmentRealizeWorkspaceParams,
   PluginEnvironmentRealizeWorkspaceResult,
   PluginEnvironmentReleaseLeaseParams,
+  PluginEnvironmentReleaseLeaseResult,
   PluginEnvironmentTerminationReceipt,
   PluginEnvironmentResumeLeaseParams,
   PluginEnvironmentValidateConfigParams,
@@ -382,10 +383,13 @@ export interface PluginDefinition {
     params: PluginEnvironmentResumeLeaseParams,
   ): Promise<PluginEnvironmentLease>;
 
-  /** Called when a run finishes and the provider lease can be released. */
+  /** Called when a run finishes and the provider lease can be released.
+   * A provider that suspends a reusable lease rather than destroying it may
+   * return `PluginEnvironmentReleaseLeaseResult` to persist a suspend receipt
+   * (`state: "stopped"`) into the lease row. */
   onEnvironmentReleaseLease?(
     params: PluginEnvironmentReleaseLeaseParams,
-  ): Promise<PluginEnvironmentTerminationReceipt | void>;
+  ): Promise<PluginEnvironmentTerminationReceipt | PluginEnvironmentReleaseLeaseResult | void>;
 
   /** Called when the host needs to force-destroy provider state. */
   onEnvironmentDestroyLease?(

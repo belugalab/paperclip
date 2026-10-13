@@ -659,6 +659,42 @@ export interface PluginEnvironmentAcquireLeaseParams extends PluginEnvironmentDr
 export interface PluginEnvironmentResumeLeaseParams extends PluginEnvironmentDriverBaseParams {
   providerLeaseId: string;
   leaseMetadata?: Record<string, unknown>;
+  /**
+   * The owning heartbeat run for THIS resume, or null for an ad-hoc/test
+   * resume. A provider that materializes run-scoped resources before the
+   * resumed sandbox accepts work (for example a bootstrap Secret the pod reads
+   * at startup, or a run-scoped egress policy) must rotate them for this run
+   * and must never reuse the previous run's credentials or network grant.
+   * When null and {@link executionWorkspaceSettings} is also absent, the
+   * provider must fall back to a rotation-from-metadata resume or report the
+   * lease expired so the host re-acquires a fresh sandbox.
+   */
+  runId?: string | null;
+  /**
+   * The agent that owns the resumed run, or null when unknown. A provider that
+   * selects per-agent runtime resources uses it; null keeps the environment's
+   * configured default.
+   */
+  agentId?: string | null;
+  /**
+   * The harness/adapter type for THIS run (the agent's adapter), or null when
+   * unknown. A provider that materializes a per-run runtime image uses it.
+   */
+  adapterType?: string | null;
+  /**
+   * The execution workspace this run maps to, or null for a task-less run. A
+   * provider that binds perspective (project) state to the sandbox uses it.
+   */
+  executionWorkspaceId?: string | null;
+  /**
+   * Run-scoped execution workspace settings to (re-)apply on resume. When null
+   * or absent, the provider must NOT reuse the previous run's run-scoped
+   * materialization (Secret, egress policy); it rotates from persisted lease
+   * metadata or returns no lease so the host re-acquires. Mirror of
+   * {@link PluginEnvironmentAcquireLeaseParams.executionWorkspaceSettings} so
+   * the resume sees the same context the acquire saw.
+   */
+  executionWorkspaceSettings?: Record<string, unknown> | null;
 }
 
 export interface PluginEnvironmentReleaseLeaseParams extends PluginEnvironmentDriverBaseParams {
@@ -674,6 +710,26 @@ export interface PluginEnvironmentReleaseLeaseParams extends PluginEnvironmentDr
 export interface PluginEnvironmentTerminationReceipt {
   providerLeaseId: string;
   state: "stopped" | "destroyed";
+}
+
+/**
+ * A richer release result a provider may return from `environmentReleaseLease`
+ * (and `environmentDestroyLease`) once it can attest a cold suspend distinct
+ * from a full destroy. `state` keeps the flat, backward-compatible termination
+ * receipt contract: `"stopped"` marks a suspend where provider resources are
+ * retained for a future resume and `"destroyed"` marks a verified teardown.
+ * `metadata` carries provider receipt detail the host persists into the lease
+ * row — `metadata.state === "stopped"` records the suspend marker so a later
+ * resume can verify the provider-side stop before re-scaling retained
+ * resources. Providers that do not support reusable leases keep returning
+ * {@link PluginEnvironmentTerminationReceipt} or void.
+ */
+export interface PluginEnvironmentReleaseLeaseResult {
+  providerLeaseId: string;
+  state?: "stopped" | "destroyed";
+  metadata?: {
+    state?: "stopped";
+  } & Record<string, unknown>;
 }
 
 export interface PluginEnvironmentDestroyLeaseParams extends PluginEnvironmentReleaseLeaseParams {}
@@ -1373,7 +1429,7 @@ export interface HostToWorkerMethods {
   ];
   environmentReleaseLease: [
     params: PluginEnvironmentReleaseLeaseParams,
-    result: PluginEnvironmentTerminationReceipt | void,
+    result: PluginEnvironmentTerminationReceipt | PluginEnvironmentReleaseLeaseResult | void,
   ];
   environmentDestroyLease: [
     params: PluginEnvironmentDestroyLeaseParams,
