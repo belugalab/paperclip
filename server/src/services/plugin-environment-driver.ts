@@ -462,6 +462,18 @@ export async function resumePluginEnvironmentLease(input: {
   config: PluginEnvironmentConfig;
   providerLeaseId: string;
   leaseMetadata?: Record<string, unknown>;
+  /**
+   * Run context for THIS resume. Optional and null-safe so a caller that only
+   * knows the lease still resumes; a provider that materializes run-scoped
+   * resources rotates them from this context or, when absent, from the
+   * persisted `leaseMetadata` (which carries the release-stop receipt) or
+   * reports the lease expired.
+   */
+  runId?: string | null;
+  agentId?: string | null;
+  adapterType?: string | null;
+  executionWorkspaceId?: string | null;
+  executionWorkspaceSettings?: Record<string, unknown> | null;
 }): Promise<PluginEnvironmentLease> {
   const { plugin } = await resolvePluginEnvironmentDriver(input);
   return await input.workerManager.call(plugin.id, "environmentResumeLease", {
@@ -472,6 +484,11 @@ export async function resumePluginEnvironmentLease(input: {
     config: input.config.driverConfig,
     providerLeaseId: input.providerLeaseId,
     leaseMetadata: input.leaseMetadata,
+    runId: input.runId ?? null,
+    agentId: input.agentId ?? null,
+    adapterType: input.adapterType ?? null,
+    executionWorkspaceId: input.executionWorkspaceId ?? null,
+    executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
   });
 }
 

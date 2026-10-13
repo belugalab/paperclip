@@ -768,6 +768,128 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     ).toHaveLength(1);
   });
 
+  it("forwards the run context and execution workspace settings on sandbox acquire and resume", async () => {
+    const seeded = await seedReusablePluginSandboxLease("opencode_local");
+    const executionWorkspaceSettings = {
+      mode: "shared_workspace",
+      workspaceRuntime: { service: "api" },
+      networkEgress: { allowFqdns: ["registry.npmjs.org"] },
+    };
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === seeded.pluginId),
+      call: vi.fn(async (_pluginId: string, method: string) => {
+        if (method === "environmentAcquireLease") {
+          return {
+            providerLeaseId: "sandbox-context-resume",
+            metadata: {
+              provider: "fake-plugin",
+              image: "fake:test",
+              timeoutMs: 1234,
+              reuseLease: true,
+              remoteCwd: "/workspace",
+            },
+          };
+        }
+        if (method === "environmentReleaseLease") return undefined;
+        if (method === "environmentResumeLease") {
+          return {
+            providerLeaseId: "sandbox-context-resume",
+            metadata: {
+              provider: "fake-plugin",
+              image: "fake:test",
+              timeoutMs: 1234,
+              reuseLease: true,
+              remoteCwd: "/workspace",
+            },
+          };
+        }
+        throw new Error(`Unexpected plugin method during context resume: ${method}`);
+      }),
+      getWorker: vi.fn(() => ({
+        supportedMethods: [
+          "environmentResumeLease",
+          "environmentReleaseLease",
+          "environmentDestroyLease",
+        ],
+      })),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+
+    await environmentService(db).releaseLease(seeded.reusableLease.id, "expired");
+    const first = await runtimeWithPlugin.acquireRunLease({
+      companyId: seeded.companyId,
+      environment: seeded.environment,
+      issueId: null,
+      agentId: seeded.agentId,
+      heartbeatRunId: seeded.runId,
+      adapterType: "opencode_local",
+      executionWorkspaceSettings,
+      persistedExecutionWorkspace: {
+        id: seeded.executionWorkspaceId,
+        mode: "shared_workspace",
+      },
+    });
+    expect(first.lease.providerLeaseId).toBe("sandbox-context-resume");
+
+    const acquireCall = workerManager.call.mock.calls.find(
+      (call) => call[1] === "environmentAcquireLease",
+    );
+    // Acceptance: the sandbox acquire dispatch forwards executionWorkspaceSettings.
+    expect(acquireCall?.[2]).toMatchObject({
+      adapterType: "opencode_local",
+      executionWorkspaceSettings,
+    });
+
+    await runtimeWithPlugin.releaseRunLeases(
+      seeded.runId,
+      "released",
+      undefined,
+      "stop_and_retain",
+    );
+
+    const nextRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: nextRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      invocationSource: "manual",
+      status: "running",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const acquired = await runtimeWithPlugin.acquireRunLease({
+      companyId: seeded.companyId,
+      environment: seeded.environment,
+      issueId: null,
+      agentId: seeded.agentId,
+      heartbeatRunId: nextRunId,
+      adapterType: "opencode_local",
+      executionWorkspaceSettings,
+      persistedExecutionWorkspace: {
+        id: seeded.executionWorkspaceId,
+        mode: "shared_workspace",
+      },
+    });
+
+    expect(acquired.lease.providerLeaseId).toBe("sandbox-context-resume");
+    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({
+      outcome: "resumed",
+    });
+
+    const resumeCall = workerManager.call.mock.calls.find(
+      (call) => call[1] === "environmentResumeLease",
+    );
+    // Acceptance: resume accepts and forwards runId + executionWorkspaceSettings
+    // (plus the rest of the run context) null-safely.
+    expect(resumeCall?.[2]).toMatchObject({
+      runId: nextRunId,
+      agentId: seeded.agentId,
+      adapterType: "opencode_local",
+      executionWorkspaceId: seeded.executionWorkspaceId,
+      executionWorkspaceSettings,
+    });
+  });
+
   it("reacquires one provider lease row idempotently during same-run recovery", async () => {
     const seeded = await seedReusablePluginSandboxLease();
     const workerManager = {
@@ -7341,6 +7463,11 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         driver: "plugin",
         pluginId,
       }),
+      runId,
+      agentId: null,
+      adapterType: null,
+      executionWorkspaceId: null,
+      executionWorkspaceSettings: null,
     });
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentRealizeWorkspace", expect.objectContaining({
       driverKey: "fake-plugin",

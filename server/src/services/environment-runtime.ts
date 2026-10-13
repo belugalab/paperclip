@@ -1954,6 +1954,18 @@ function createSandboxEnvironmentDriver(
                     environmentId: input.environment.id,
                     issueId: input.issueId,
                     config: workerConfig,
+                    // Forward the run identity/settings for THIS resume so a
+                    // provider that materializes run-scoped resources (k8s
+                    // bootstrap Secret, Cilium egress policy) rotates them for
+                    // this run before the sandbox accepts work. Null-safe: an
+                    // ad-hoc/test resume forwards null and the provider must
+                    // fall back to rotation-from-metadata or report expired.
+                    runId: input.heartbeatRunId ?? null,
+                    agentId: input.agentId,
+                    adapterType: input.adapterType,
+                    executionWorkspaceId: input.executionWorkspaceId,
+                    executionWorkspaceSettings:
+                      input.executionWorkspaceSettings as Record<string, unknown> | null,
                     providerLeaseId: reusableLease.providerLeaseId,
                     leaseMetadata: reusableLease.metadata ?? undefined,
                   },
@@ -2043,6 +2055,12 @@ function createSandboxEnvironmentDriver(
             // environment's default adapter image (a pi agent then runs in the
             // opencode image and the harness binary is missing at exec time).
             adapterType: input.adapterType ?? undefined,
+            // Run-scoped execution workspace settings (k8s bootstrap Secret,
+            // Cilium egress policy). Mirror the standalone plugin-driver acquire
+            // path so a plugin-backed sandbox provision sees the same run
+            // context. Null-safe for ad-hoc/test acquires.
+            executionWorkspaceSettings:
+              input.executionWorkspaceSettings as Record<string, unknown> | null,
             // Forward a caller deadline so the provider configures a provider-side
             // expiry at or before it and returns the real provider expiry.
             ...(requestedExpiresAtParam(input.requestedExpiresAt) !== undefined
@@ -3444,6 +3462,12 @@ function createPluginEnvironmentDriver(
         },
         providerLeaseId: input.lease.providerLeaseId,
         leaseMetadata: input.lease.metadata ?? undefined,
+        // Derive the run context the lease records; execution workspace settings
+        // are not persisted on a plugin (non-sandbox) lease, so the provider
+        // falls back to rotation-from-metadata or reports expired.
+        runId: input.lease.heartbeatRunId,
+        agentId: readString(input.lease.metadata?.agentId),
+        executionWorkspaceId: input.lease.executionWorkspaceId,
       });
     },
 
