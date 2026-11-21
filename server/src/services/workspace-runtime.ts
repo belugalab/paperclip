@@ -161,6 +161,8 @@ export type GitRemoteAuthInvocation = {
   secretName?: string | null;
   /** Human-readable host name for auth-failure warnings, e.g. "GitHub" or "GitLab". */
   providerLabel?: string | null;
+  /** Provider whose credential helper carries the token; defaults to GitHub for fakes. */
+  providerId?: "github" | "gitlab";
 };
 
 export type GitRemoteAuthProvider = (remoteUrl: string) => Promise<GitRemoteAuthInvocation | null>;
@@ -3917,7 +3919,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         if (!auth) return null;
         const source = auth.source;
         if (source !== "company_secret" && source !== "managed_connection" && source !== "server_env") throw new GitCacheRestorationFailure();
-        return { ...auth, source, secretName: auth.secretName ?? null };
+        return { ...auth, source, secretName: auth.secretName ?? null, providerId: auth.providerId ?? "github", providerLabel: auth.providerLabel ?? "git" };
       },
       authorizeSource: async source => {
         if (!input.db || !input.workspace.projectId) throw new GitCacheRestorationFailure();

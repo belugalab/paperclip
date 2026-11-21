@@ -387,7 +387,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
           if (acquisitionRestricted && !existing) throw forbidden(controllerAcquisitionMessage);
           return existing;
         });
-        const anonymous = buildGitAuthInvocation({ token: "", source: "managed_connection", secretName: null });
+        const anonymous = buildGitAuthInvocation({ token: "", source: "managed_connection", secretName: null, providerId: "github" });
         anonymous.env = { ...anonymous.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
         if (!acquisitionRestricted) await measureRunPhase("workspace.repository.state_write", () => db.update(executionWorkspaceRepositories).set({ state: "preparing", catalogRepositoryId: source.catalogRepositoryId, failureCode: null, updatedAt: new Date() }).where(eq(executionWorkspaceRepositories.id, row.id)));
         try {
