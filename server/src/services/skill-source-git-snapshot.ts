@@ -44,7 +44,7 @@ function gitEnvironment(token: string) {
   // Do not inherit host Git config, credential helpers, tracing, object directories,
   // URL rewrites, or checkout filters. The existing host-scoped helper keeps tokens
   // in the child environment, never argv, remote URLs, or repository config.
-  const authorization = buildGitAuthInvocation({ token, source: 'managed_connection', secretName: null }).env;
+  const authorization = buildGitAuthInvocation({ token, source: 'managed_connection', secretName: null, providerId: 'github' }).env;
   // Public GitHub remotes need not issue a credential challenge. Send the chosen
   // caller's authorization proactively, scoped to GitHub with redirects disabled.
   const index = Number(authorization.GIT_CONFIG_COUNT);
