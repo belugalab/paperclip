@@ -192,6 +192,7 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
   activeWakeupPromises: Set<Promise<unknown>>;
   liveRunExecutions: { has(id: string): boolean };
   isHeartbeatRunTerminalStatus: (status: string | null | undefined) => boolean;
+  adapterConcurrencyLimits?: Record<string, number>;
   isSameTaskScope: (left: string | null, right: string | null) => boolean;
   runTaskKey: (run: HeartbeatRun) => string | null;
   filterZombieCoalesceTarget: <T extends { id: string; status: string }>(run: T | null, live: { has(id: string): boolean }) => T | null;
@@ -362,6 +363,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     resolveResponsibleUserIdForRun,
     getIssueExecutionContext,
     isHeartbeatRunTerminalStatus,
+    adapterConcurrencyLimits = {},
     liveRunExecutions,
     getSchedulingSuppression,
     resumeExecutionWaitComments,
@@ -1896,6 +1898,130 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     }
   }
 
+  // Counts running runs instance-wide for one adapter type, e.g. so five
+  // agents that all use "litellm" share one admission budget instead of each
+  // getting their own maxConcurrentRuns worth of slots against the same
+  // downstream gateway. See resolveAdapterConcurrencyLimits in heartbeat.ts
+  // for the config shape (issue: shared concurrency bucket per adapter type).
+  async function countRunningRunsForAdapterType(
+    adapterType: string,
+    executor: Db = db,
+  ) {
+    // claimQueuedRun stamps the adapter type it actually dispatched under into
+    // runnerProfileJson.adapterDispatch.adapterType at the moment it flips a
+    // run to "running". Count against that captured identity, not the agent's
+    // current adapterType: an operator can reassign an agent to a different
+    // adapter type while one of its runs is still active, and joining on the
+    // live column would then move that running run into the new type's
+    // bucket -- freeing a slot in the old bucket while the process backing it
+    // is still running, and consuming one in the new bucket for a run that
+    // was never dispatched there. The coalesce falls back to the agent's
+    // current type only for the rare row with no captured value at all.
+    const dispatchedAdapterType = sql<string | null>`${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType'`;
+    const [{ count }] = await executor
+      .select({ count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
+      .where(
+        and(
+          eq(heartbeatRuns.status, "running"),
+          eq(
+            sql`coalesce(${dispatchedAdapterType}, ${agents.adapterType})`,
+            adapterType,
+          ),
+        ),
+      );
+    return Number(count ?? 0);
+  }
+
+  // Claims up to `maxClaims` of `prioritizedRuns` for `agent`.
+  //
+  // When the agent's adapter type has no PAPERCLIP_ADAPTER_CONCURRENCY_LIMITS
+  // entry, this is exactly the old unguarded loop: claim in priority order
+  // until `maxClaims` is reached.
+  //
+  // When a limit is configured, the whole batch is claimed inside one
+  // transaction that holds a `pg_advisory_xact_lock` keyed by the adapter
+  // type name for as long as the transaction is open. That lock is what
+  // closes the race a bare "count, then claim" check leaves open: without
+  // holding it across the claims themselves, two callers sharing the adapter
+  // type could each read the same "capacity available" count before either
+  // commits a claim, and both would then admit a run.
+  //
+  // The lock is transaction-scoped (`pg_advisory_xact_lock`, not
+  // `pg_advisory_lock`): Postgres releases it automatically at COMMIT or
+  // ROLLBACK, on whichever backend happens to run this transaction, so it
+  // needs no unlock call and does not depend on two statements landing on
+  // the same physical connection -- unlike a session-scoped lock taken on a
+  // client-reserved connection, which a transaction-mode external pooler can
+  // silently break.
+  //
+  // The count check runs as its own statement on this same transaction
+  // (`tx`, not the outer pooled `db`), *after* the lock statement: Postgres
+  // takes a fresh snapshot per statement under READ COMMITTED, so a count
+  // statement that only starts executing once the lock is acquired correctly
+  // sees every run any other holder of this same lock already committed --
+  // folding both into one statement (e.g. as extra WHERE-clause conditions
+  // on the claim's own UPDATE) does not: that UPDATE's snapshot is taken
+  // before it blocks on the lock, so its count sub-expression can still miss
+  // a just-committed row once it unblocks and proceeds.
+  //
+  // The individual claimQueuedRun calls below still run on the outer pooled
+  // `db`, in their own separate transactions -- not on `tx`. That is safe
+  // (this wrapper's lock stays held across all of them regardless of which
+  // connection performs the actual claim), but it does mean this feature
+  // needs at least 2 pooled connections: one held by this wrapper's `tx` for
+  // the lock, and at least one more for claimQueuedRun's own work. See the
+  // DATABASE_POOL_MAX check in resolveAdapterConcurrencyLimits' caller.
+  async function claimRunsWithAdapterConcurrencyGuard(
+    agent: typeof agents.$inferSelect,
+    prioritizedRuns: Array<typeof heartbeatRuns.$inferSelect>,
+    maxClaims: number,
+    companyAgents: AgentOrgRow[],
+    rejectedClaims: Array<{ run: typeof heartbeatRuns.$inferSelect; err: HttpError }>,
+    deferredPostCommitEffects: WakeQueuePostCommitEffect[],
+  ) {
+    const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+    // Claim rejections are handled here rather than at the call site so both
+    // the unguarded and advisory-lock paths keep the same semantics.
+    const tryClaim = async (queuedRun: typeof heartbeatRuns.$inferSelect) => {
+      try {
+        return await claimQueuedRun(queuedRun, companyAgents, deferredPostCommitEffects);
+      } catch (err) {
+        if (isPermanentClaimRejection(err)) {
+          rejectedClaims.push({ run: queuedRun, err });
+          return null;
+        }
+        if (!isDeferrableClaimRejection(err)) throw err;
+        logger.warn(
+          { err, runId: queuedRun.id, agentId: queuedRun.agentId, companyId: queuedRun.companyId },
+          "queued heartbeat run claim was rejected; leaving it queued for the next recovery pass",
+        );
+        return null;
+      }
+    };
+    const limit = adapterConcurrencyLimits[agent.adapterType];
+    if (limit === undefined) {
+      for (const queuedRun of prioritizedRuns) {
+        if (claimedRuns.length >= maxClaims) break;
+        const claimed = await tryClaim(queuedRun);
+        if (claimed) claimedRuns.push(claimed);
+      }
+      return claimedRuns;
+    }
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${agent.adapterType}))`);
+      const running = await countRunningRunsForAdapterType(agent.adapterType, tx as unknown as Db);
+      const allowed = Math.max(0, Math.min(maxClaims, limit - running));
+      for (const queuedRun of prioritizedRuns) {
+        if (claimedRuns.length >= allowed) break;
+        const claimed = await tryClaim(queuedRun);
+        if (claimed) claimedRuns.push(claimed);
+      }
+    });
+    return claimedRuns;
+  }
+
   async function startNextQueuedRunForAgent(agentId: string) {
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
@@ -2009,26 +2135,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         return left.createdAt.getTime() - right.createdAt.getTime();
       });
 
-      const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
-      for (const queuedRun of prioritizedRuns) {
-        if (claimedRuns.length >= availableSlots) break;
-        let claimed: typeof heartbeatRuns.$inferSelect | null;
-        try {
-          claimed = await claimQueuedRun(queuedRun, companyAgents, deferredPostCommitEffects);
-        } catch (err) {
-          if (isPermanentClaimRejection(err)) {
-            rejectedClaims.push({ run: queuedRun, err });
-            continue;
-          }
-          if (!isDeferrableClaimRejection(err)) throw err;
-          logger.warn(
-            { err, runId: queuedRun.id, agentId: queuedRun.agentId, companyId: queuedRun.companyId },
-            "queued heartbeat run claim was rejected; leaving it queued for the next recovery pass",
-          );
-          continue;
-        }
-        if (claimed) claimedRuns.push(claimed);
-      }
+      const claimedRuns = await claimRunsWithAdapterConcurrencyGuard(
+        agent,
+        prioritizedRuns,
+        availableSlots,
+        companyAgents,
+        rejectedClaims,
+        deferredPostCommitEffects,
+      );
       if (claimedRuns.length === 0) return [];
 
       for (const claimedRun of claimedRuns) {
