@@ -105,20 +105,24 @@ hang; BusyBox `tar` makes `file-sync.test.ts` fail.
 
 `scripts/build-images-for-tags.sh` builds one image per ref from a clean detached worktree,
 so an uncommitted workspace cannot leak into a build. With no arguments it builds the six
-upstream release tags in the sequence above plus the five `fixes/synced-*` checkpoints:
+upstream release tags in the sequence above plus the five `fixes/synced-*` checkpoints, using
+the `cloud` target with the Kubernetes sandbox provider bundled.
 
 ```sh
-scripts/build-images-for-tags.sh                 # all 11 refs, target production
+scripts/build-images-for-tags.sh                 # all 11 refs, cloud + kubernetes
 scripts/build-images-for-tags.sh --upstream-only # only the six upstream tags
+scripts/build-images-for-tags.sh --target production  # lean self-hosted image, no plugins
+scripts/build-images-for-tags.sh --plugins "daytona kubernetes"
 scripts/build-images-for-tags.sh --dry-run       # print the exact docker/podman commands
-scripts/build-images-for-tags.sh --target cloud --image-prefix paperclip-preview fixes/main
+scripts/build-images-for-tags.sh --image-prefix paperclip-preview fixes/main
 ```
 
 Images are named `<prefix>:<ref>` (`/` becomes `-`), the full commit SHA is passed as
 `PAPERCLIP_BUILD_COMMIT` for the remote provider pack, and `CLI_TOOLS_CACHE_EPOCH` uses the
-same weekly value as CI. Failures are collected per tag and the script exits non-zero if any
-tag failed. Use `--report FILE` for a status table and `--keep-worktrees` to inspect a failed
-build context.
+same weekly value as CI. **An image that already exists locally is skipped**, so the existing
+`paperclip-local:v2026.1001.0` is never overwritten; `--force` opts in to rebuilding. Failures
+are collected per tag and the script exits non-zero if any tag failed. Use `--report FILE` for a
+status table and `--keep-worktrees` to inspect a failed build context.
 
 This sandbox has no docker/podman, so only `--dry-run` was exercised here.
 
