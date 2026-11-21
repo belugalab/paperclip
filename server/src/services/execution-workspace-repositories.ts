@@ -437,7 +437,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
           }
         };
         await verify();
-        const anonymous = buildGitAuthInvocation({ token: "", source: "managed_connection", secretName: null });
+        const anonymous = buildGitAuthInvocation({ token: "", source: "managed_connection", secretName: null, providerId: "github" });
         anonymous.env = { ...anonymous.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
         try {
           const result = await prepareRemoteWorkspaceRepository({

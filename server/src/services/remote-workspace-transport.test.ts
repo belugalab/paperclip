@@ -1592,7 +1592,7 @@ fs.unlinkSync(${JSON.stringify(kill)});process.kill(process.pid,'SIGKILL');}retu
       preparationIdentity: createHash("sha256").update("synthetic-filter-preparation").digest("hex"),
       source: { kind: "git", repoUrl: origin, ref: "HEAD~1" },
       resolveGitAuth: async () => ({ configArgs: [], env: { PAPERCLIP_GIT_TOKEN: "SYNTHETIC_ONLY" },
-        source: "company_secret", secretName: "SYNTHETIC_FIXTURE" }) });
+        source: "company_secret", secretName: "SYNTHETIC_FIXTURE", providerId: "github", providerLabel: "GitHub" }) });
     expect(await fs.readFile(path.join(workspace, "clone", "source.txt"), "utf8")).toBe("initial synthetic source\n");
     expect(await fs.lstat(sentinel).catch(() => null)).toBeNull();
   });
@@ -1732,7 +1732,7 @@ fs.unlinkSync(${JSON.stringify(kill)});process.kill(process.pid,'SIGKILL');}retu
     const rewrite = { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: `url.${pathToFileURL(origin).href}.insteadOf`,
       GIT_CONFIG_VALUE_0: remoteUrl };
     const resolveGitAuth = async () => ({ configArgs: [], env: rewrite,
-      source: "company_secret" as const, secretName: "SYNTHETIC_FIXTURE" });
+      source: "company_secret" as const, secretName: "SYNTHETIC_FIXTURE", providerId: "github" as const, providerLabel: "GitHub" });
     const { remote } = target({ GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "remote.origin.url",
       GIT_CONFIG_VALUE_0: "synthetic-wrong-ambient-origin" });
     const root = path.join(workspace, "rewritten-root");
