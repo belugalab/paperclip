@@ -76,6 +76,7 @@ describe("resolveGitHubApiCredential", () => {
     const secrets = buildSecretsFake({});
     const credential = await resolveGitHubApiCredential(fakeDb, "company-1", { secrets, env: {} });
     expect(credential).toBeNull();
+  });
 });
 
 describe("isGitLabHttpsRemoteUrl", () => {
