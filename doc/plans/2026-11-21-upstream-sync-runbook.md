@@ -115,6 +115,7 @@ scripts/build-images-for-tags.sh --target production  # lean self-hosted image, 
 scripts/build-images-for-tags.sh --plugins "daytona kubernetes"
 scripts/build-images-for-tags.sh --dry-run       # print the exact docker/podman commands
 scripts/build-images-for-tags.sh --image-prefix paperclip-preview fixes/main
+scripts/build-images-for-tags.sh --push --image-repo ghcr.io/belugalab/paperclip --upstream-only
 ```
 
 Images are named `<prefix>:<ref>` (`/` becomes `-`), the full commit SHA is passed as
@@ -122,9 +123,18 @@ Images are named `<prefix>:<ref>` (`/` becomes `-`), the full commit SHA is pass
 same weekly value as CI. **An image that already exists locally is skipped**, so the existing
 `paperclip-local:v2026.1001.0` is never overwritten; `--force` opts in to rebuilding. Failures
 are collected per tag and the script exits non-zero if any tag failed. Use `--report FILE` for a
-status table and `--keep-worktrees` to inspect a failed build context.
+status table (now with a `REMOTE` column) and `--keep-worktrees` to inspect a failed build context.
 
-This sandbox has no docker/podman, so only `--dry-run` was exercised here.
+Pushing is opt-in with `--push`. The script tags each built image as
+`<image-repo>:<ref>` in addition to the local tag and pushes it only after the build (and optional
+`--verify`) succeeds. The default repository is `ghcr.io/paperclipai/paperclip`; override it with
+`--image-repo`, for example `ghcr.io/belugalab/paperclip`. **Skipped images are not pushed**: use
+`--force --push` to rebuild and publish an existing local ref. The script does not run
+`docker login`; authenticate with the registry first.
+
+This sandbox has no docker/podman or host `pnpm`, so builds were exercised with `--dry-run`
+and a fake container runtime that verified skip, force, push, and failure paths; no real image
+was built or pushed here.
 
 ## Increment log
 

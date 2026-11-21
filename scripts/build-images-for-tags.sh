@@ -9,6 +9,9 @@
 #
 # No host pnpm is required: the Dockerfile resolves pnpm-lock.yaml inside its
 # own deps stage. A container runtime (docker or podman) is required.
+# Pushing is opt-in via --push; log in to the registry beforehand. Images that
+# are skipped because they already exist locally are never pushed unless
+# --force is also given.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -35,6 +38,8 @@ PLUGINS=kubernetes
 PLUGINS_SET=0
 RUNTIME=""
 IMAGE_PREFIX=paperclip-local
+IMAGE_REPO=ghcr.io/paperclipai/paperclip
+PUSH=0
 UPSTREAM_ONLY=0
 FETCH=0
 FORCE=0
@@ -52,13 +57,18 @@ Build the cloud image (Kubernetes plugin bundled) for every supplied git
 tag/ref. With no TAGs, build the release tags from the upstream-sync runbook
 plus the fork checkpoint tags. Existing local images are skipped by default,
 so an image you already have (for example v2026.1001.0) is never overwritten.
+Pushing is opt-in: --push tags and pushes each successfully built image to
+--image-repo; skipped images are not pushed unless --force is also given.
+Log in to the registry before using --push.
 
 Options:
   --target NAME       Dockerfile stage: cloud (default) or production
   --plugins LIST      sandbox providers to bundle in cloud (default: kubernetes)
   --no-plugins        build the cloud target with no bundled providers
   --runtime NAME      docker or podman (auto-detected by default)
-  --image-prefix P    image name prefix (default: paperclip-local)
+  --image-prefix P    local image name prefix (default: paperclip-local)
+  --push              push each built image to --image-repo after a successful build
+  --image-repo REPO   registry repository for --push (default: ghcr.io/paperclipai/paperclip)
   --upstream-only     with no TAGs, build only upstream release tags
   --fetch             run `git fetch origin --tags --force` first
   --force             rebuild images that already exist locally
@@ -74,6 +84,7 @@ Examples:
   scripts/build-images-for-tags.sh --plugins "daytona kubernetes"
   scripts/build-images-for-tags.sh v2026.1106.0 v2026.1117.0 --verify
   scripts/build-images-for-tags.sh fixes/main --image-prefix paperclip-preview
+  scripts/build-images-for-tags.sh --push --image-repo ghcr.io/belugalab/paperclip --upstream-only
 EOF
 }
 
@@ -85,6 +96,9 @@ while (($#)); do
     --runtime=*)      RUNTIME="${1#*=}"; shift ;;
     --image-prefix)   IMAGE_PREFIX="$2"; shift 2 ;;
     --image-prefix=*) IMAGE_PREFIX="${1#*=}"; shift ;;
+    --push)           PUSH=1; shift ;;
+    --image-repo)     IMAGE_REPO="$2"; shift 2 ;;
+    --image-repo=*)   IMAGE_REPO="${1#*=}"; shift ;;
     --plugins)        PLUGINS="$2"; PLUGINS_SET=1; shift 2 ;;
     --plugins=*)      PLUGINS="${1#*=}"; PLUGINS_SET=1; shift ;;
     --no-plugins)     PLUGINS=""; PLUGINS_SET=1; shift ;;
@@ -108,6 +122,11 @@ if ((${#TAGS[@]} == 0)); then
   if ((!UPSTREAM_ONLY)); then
     TAGS+=("${FORK_TAGS[@]}")
   fi
+fi
+
+if ((PUSH)) && [[ -z "$IMAGE_REPO" ]]; then
+  echo "ERROR: --push requires a non-empty --image-repo" >&2
+  exit 2
 fi
 
 if [[ -z "$RUNTIME" ]]; then
@@ -178,37 +197,39 @@ cleanup() {
 }
 trap cleanup EXIT
 
-printf '%-36s %-9s %s\n' REF STATUS IMAGE
+printf '%-36s %-9s %-40s %s\n' REF STATUS IMAGE REMOTE
 if [[ -n "$REPORT" ]]; then
   printf '# image builds %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$REPORT"
 fi
 
 failed=0
 for ref in "${TAGS[@]}"; do
-  if ! sha="$(git -C "$REPO_ROOT" rev-parse --verify "${ref}^{commit}" 2>/dev/null)"; then
-    echo "ERROR: cannot resolve ref: $ref" >&2
-    RESULTS+=("fail|$ref|-|unresolved ref")
-    failed=$((failed + 1))
-    printf '%-36s %-9s %s\n' "$ref" FAIL -
-    continue
-  fi
-
   safe="${ref//\//-}"
   image="${IMAGE_PREFIX}:${safe}"
+  remote="$IMAGE_REPO:$safe"
+  remote_cell="-"
   worktree="$WORK_ROOT/$safe"
   log="$WORK_ROOT/$safe.log"
 
+  if ! sha="$(git -C "$REPO_ROOT" rev-parse --verify "${ref}^{commit}" 2>/dev/null)"; then
+    echo "ERROR: cannot resolve ref: $ref" >&2
+    RESULTS+=("fail|$ref|$image|$remote_cell|unresolved ref")
+    failed=$((failed + 1))
+    printf '%-36s %-9s %-40s %s\n' "$ref" FAIL "$image" -
+    continue
+  fi
+
   if ((!FORCE)) && image_exists "$image"; then
-    echo "==> $ref -> $image already exists; skipping (use --force to rebuild)"
-    RESULTS+=("skip|$ref|$image|$sha")
-    printf '%-36s %-9s %s\n' "$ref" SKIP "$image"
+    echo "==> $ref -> $image already exists; skipping (use --force to rebuild and --force --push to push)"
+    RESULTS+=("skip|$ref|$image|$remote_cell|$sha")
+    printf '%-36s %-9s %-40s %s\n' "$ref" SKIP "$image" -
     continue
   fi
 
   if ! git -C "$REPO_ROOT" worktree add --detach "$worktree" "$sha" >/dev/null 2>&1; then
-    RESULTS+=("fail|$ref|$image|worktree add failed")
+    RESULTS+=("fail|$ref|$image|$remote_cell|worktree add failed")
     failed=$((failed + 1))
-    printf '%-36s %-9s %s\n' "$ref" FAIL "$image"
+    printf '%-36s %-9s %-40s %s\n' "$ref" FAIL "$image" -
     continue
   fi
   WORKTREES+=("$worktree")
@@ -222,6 +243,9 @@ for ref in "${TAGS[@]}"; do
     --build-arg "PAPERCLIP_BUILD_VERSION=$ref"
     --build-arg "CLI_TOOLS_CACHE_EPOCH=$EPOCH"
   )
+  if ((PUSH)); then
+    args+=(--tag "$remote")
+  fi
   if [[ "$TARGET" == cloud ]]; then
     args+=(
       --build-arg "CLOUD_BUNDLED_PLUGINS=$PLUGINS"
@@ -231,16 +255,35 @@ for ref in "${TAGS[@]}"; do
     echo "WARNING: --plugins only applies to the cloud target; ignoring for $TARGET" >&2
   fi
 
-  echo "==> $ref @ ${sha:0:12} -> $image ($RUNTIME, target $TARGET, plugins: $PLUGIN_LABEL)"
+  target_note="target $TARGET, plugins: $PLUGIN_LABEL"
+  if ((PUSH)); then
+    echo "==> $ref @ ${sha:0:12} -> $image (+ $remote) ($RUNTIME, $target_note)"
+  else
+    echo "==> $ref @ ${sha:0:12} -> $image ($RUNTIME, $target_note)"
+  fi
   status=ok
   if ((DRY_RUN)); then
     printf '    '
     printf '%q ' "$RUNTIME" "${args[@]}" "$worktree"
     printf '\n'
+    if ((PUSH)); then
+      printf '    '
+      printf '%q push %q\n' "$RUNTIME" "$remote"
+      remote_cell="$remote"
+    fi
   elif "$RUNTIME" "${args[@]}" "$worktree" 2>&1 | tee "$log"; then
     if ((VERIFY)); then
       if "$RUNTIME" run --rm "$image" node --version >/dev/null 2>&1; then
         status=ok
+      else
+        status=fail
+      fi
+    fi
+    if [[ "$status" == ok ]] && ((PUSH)); then
+      echo "==> Pushing $remote"
+      remote_cell="$remote"
+      if "$RUNTIME" push "$remote" 2>&1 | tee -a "$log"; then
+        :
       else
         status=fail
       fi
@@ -253,15 +296,15 @@ for ref in "${TAGS[@]}"; do
     failed=$((failed + 1))
     echo "    FAILED: see $log" >&2
   fi
-  RESULTS+=("$status|$ref|$image|$sha")
-  printf '%-36s %-9s %s\n' "$ref" "${status^^}" "$image"
+  RESULTS+=("$status|$ref|$image|$remote_cell|$sha")
+  printf '%-36s %-9s %-40s %s\n' "$ref" "${status^^}" "$image" "$remote_cell"
 done
 
 if [[ -n "$REPORT" ]]; then
-  printf '%-36s %-9s %s\n' REF STATUS IMAGE >> "$REPORT"
+  printf '%-36s %-9s %-40s %s\n' REF STATUS IMAGE REMOTE >> "$REPORT"
   for row in "${RESULTS[@]}"; do
-    IFS='|' read -r status ref image sha <<< "$row"
-    printf '%-36s %-9s %s\n' "$ref" "${status^^}" "$image" >> "$REPORT"
+    IFS='|' read -r status ref image remote_cell _detail <<< "$row"
+    printf '%-36s %-9s %-40s %s\n' "$ref" "${status^^}" "$image" "$remote_cell" >> "$REPORT"
   done
 fi
 
