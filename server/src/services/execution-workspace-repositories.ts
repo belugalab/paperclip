@@ -549,7 +549,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
           if (acquisitionRestricted && !existing) throw forbidden(controllerAcquisitionMessage);
           return existing;
         });
-        const anonymous = buildGitAuthInvocation({ token: "", source: "managed_connection", secretName: null });
+        const anonymous = buildGitAuthInvocation({ token: "", source: "managed_connection", secretName: null, providerId: "github" });
         anonymous.env = { ...anonymous.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
         if (!acquisitionRestricted) {
           // Claim the receipt at the ref this admission uses. Correction only
