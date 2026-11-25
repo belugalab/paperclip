@@ -116,6 +116,7 @@ scripts/build-images-for-tags.sh --plugins "daytona kubernetes"
 scripts/build-images-for-tags.sh --dry-run       # print the exact docker/podman commands
 scripts/build-images-for-tags.sh --image-prefix paperclip-preview fixes/main
 scripts/build-images-for-tags.sh --push --image-repo ghcr.io/belugalab/paperclip --upstream-only
+scripts/build-images-for-tags.sh --push-existing --image-repo registry.gitlab.com/castorinop/k3s-lab/paperclip-server v2026.1117.0
 ```
 
 Images are named `<prefix>:<ref>` (`/` becomes `-`), the full commit SHA is passed as
@@ -128,9 +129,11 @@ status table (now with a `REMOTE` column) and `--keep-worktrees` to inspect a fa
 Pushing is opt-in with `--push`. The script tags each built image as
 `<image-repo>:<ref>` in addition to the local tag and pushes it only after the build (and optional
 `--verify`) succeeds. The default repository is `ghcr.io/paperclipai/paperclip`; override it with
-`--image-repo`, for example `ghcr.io/belugalab/paperclip`. **Skipped images are not pushed**: use
-`--force --push` to rebuild and publish an existing local ref. The script does not run
-`docker login`; authenticate with the registry first.
+`--image-repo`, for example `ghcr.io/belugalab/paperclip`. **Skipped images are not pushed** by
+`--push` alone; use `--force --push` to rebuild and publish an existing local ref, or
+`--push-existing` to publish that local image as-is without a rebuild (needed when a rebuild does
+not fit on disk). `--push-existing` implies `--push` and cannot be combined with `--force`. The
+script does not run `docker login`; authenticate with the registry first.
 
 This sandbox has no docker/podman or host `pnpm`, so builds were exercised with `--dry-run`
 and a fake container runtime that verified skip, force, push, and failure paths; no real image

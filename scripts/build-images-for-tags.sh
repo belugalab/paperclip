@@ -10,8 +10,9 @@
 # No host pnpm is required: the Dockerfile resolves pnpm-lock.yaml inside its
 # own deps stage. A container runtime (docker or podman) is required.
 # Pushing is opt-in via --push; log in to the registry beforehand. Images that
-# are skipped because they already exist locally are never pushed unless
-# --force is also given.
+# already exist locally are skipped by default; --push-existing publishes one
+# of those images without rebuilding it (useful when a rebuild cannot fit on
+# disk). --force still rebuilds and is mutually exclusive with --push-existing.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -40,6 +41,7 @@ RUNTIME=""
 IMAGE_PREFIX=paperclip-local
 IMAGE_REPO=ghcr.io/paperclipai/paperclip
 PUSH=0
+PUSH_EXISTING=0
 UPSTREAM_ONLY=0
 FETCH=0
 FORCE=0
@@ -58,8 +60,9 @@ tag/ref. With no TAGs, build the release tags from the upstream-sync runbook
 plus the fork checkpoint tags. Existing local images are skipped by default,
 so an image you already have (for example v2026.1001.0) is never overwritten.
 Pushing is opt-in: --push tags and pushes each successfully built image to
---image-repo; skipped images are not pushed unless --force is also given.
-Log in to the registry before using --push.
+--image-repo. Images that already exist locally are skipped; --push-existing
+publishes one of those images as-is, with no rebuild, while --force rebuilds it.
+Log in to the registry before pushing.
 
 Options:
   --target NAME       Dockerfile stage: cloud (default) or production
@@ -68,6 +71,8 @@ Options:
   --runtime NAME      docker or podman (auto-detected by default)
   --image-prefix P    local image name prefix (default: paperclip-local)
   --push              push each built image to --image-repo after a successful build
+  --push-existing     push an already-existing local image instead of rebuilding it
+                      (implies --push; cannot be combined with --force)
   --image-repo REPO   registry repository for --push (default: ghcr.io/paperclipai/paperclip)
   --upstream-only     with no TAGs, build only upstream release tags
   --fetch             run `git fetch origin --tags --force` first
@@ -83,6 +88,7 @@ Examples:
   scripts/build-images-for-tags.sh --target production   # lean self-hosted image
   scripts/build-images-for-tags.sh --plugins "daytona kubernetes"
   scripts/build-images-for-tags.sh v2026.1106.0 v2026.1117.0 --verify
+  scripts/build-images-for-tags.sh --push-existing v2026.1117.0
   scripts/build-images-for-tags.sh fixes/main --image-prefix paperclip-preview
   scripts/build-images-for-tags.sh --push --image-repo ghcr.io/belugalab/paperclip --upstream-only
 EOF
@@ -97,6 +103,7 @@ while (($#)); do
     --image-prefix)   IMAGE_PREFIX="$2"; shift 2 ;;
     --image-prefix=*) IMAGE_PREFIX="${1#*=}"; shift ;;
     --push)           PUSH=1; shift ;;
+    --push-existing)  PUSH=1; PUSH_EXISTING=1; shift ;;
     --image-repo)     IMAGE_REPO="$2"; shift 2 ;;
     --image-repo=*)   IMAGE_REPO="${1#*=}"; shift ;;
     --plugins)        PLUGINS="$2"; PLUGINS_SET=1; shift 2 ;;
@@ -126,6 +133,11 @@ fi
 
 if ((PUSH)) && [[ -z "$IMAGE_REPO" ]]; then
   echo "ERROR: --push requires a non-empty --image-repo" >&2
+  exit 2
+fi
+
+if ((PUSH_EXISTING && FORCE)); then
+  echo "ERROR: --push-existing and --force are mutually exclusive" >&2
   exit 2
 fi
 
@@ -220,7 +232,35 @@ for ref in "${TAGS[@]}"; do
   fi
 
   if ((!FORCE)) && image_exists "$image"; then
-    echo "==> $ref -> $image already exists; skipping (use --force to rebuild and --force --push to push)"
+    if ((PUSH_EXISTING)); then
+      echo "==> $ref -> $image already exists; publishing $remote without rebuilding"
+      remote_cell="$remote"
+      status=ok
+      if ((DRY_RUN)); then
+        printf '    '
+        printf '%q tag %q %q\n' "$RUNTIME" "$image" "$remote"
+        printf '    '
+        printf '%q push %q\n' "$RUNTIME" "$remote"
+      elif ((VERIFY)) && ! "$RUNTIME" run --rm "$image" node --version >/dev/null 2>&1; then
+        status=fail
+      elif "$RUNTIME" tag "$image" "$remote" >/dev/null 2>&1 && "$RUNTIME" push "$remote" 2>&1 | tee "$log"; then
+        status=ok
+      else
+        status=fail
+      fi
+      if [[ "$status" != ok ]]; then
+        failed=$((failed + 1))
+        echo "    FAILED: see $log" >&2
+      fi
+      RESULTS+=("$status|$ref|$image|$remote_cell|$sha")
+      printf '%-36s %-9s %-40s %s\n' "$ref" "${status^^}" "$image" "$remote_cell"
+      continue
+    fi
+    if ((PUSH)); then
+      echo "==> $ref -> $image already exists; skipping (use --push-existing to publish it, or --force --push to rebuild and push)"
+    else
+      echo "==> $ref -> $image already exists; skipping (use --force to rebuild)"
+    fi
     RESULTS+=("skip|$ref|$image|$remote_cell|$sha")
     printf '%-36s %-9s %-40s %s\n' "$ref" SKIP "$image" -
     continue
