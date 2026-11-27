@@ -62,6 +62,12 @@ import {
 // from the server pod.
 const PAPERCLIP_SERVER_NAMESPACE = "paperclip";
 
+// Every agent pod mounts its workspace here (see pod-spec-builder). Recording
+// it on the lease at acquire/resume time gives native file sync a concrete
+// confinement root before realize runs, while resolveSyncRemoteDir still fails
+// closed if a malformed lease has no root at all.
+const DEFAULT_SYNC_REMOTE_DIR = "/workspace";
+
 // Name of the ServiceAccount created inside each tenant namespace by ensureTenant.
 const TENANT_SERVICE_ACCOUNT = "paperclip-tenant-sa";
 
@@ -125,9 +131,9 @@ const RESUME_READY_TIMEOUT_MS = 30_000;
 const RESUME_READY_POLL_MS = 1_000;
 
 // The workspace remote dir is the confinement root for native file sync. It is
-// recorded on the lease metadata at realizeWorkspace time (`remoteCwd`); require
-// it so a sync can never run without a concrete root to confine every sandbox
-// path against.
+// recorded on the lease at acquire/resume time (`remoteCwd`) and refreshed by
+// realizeWorkspace. Require it so a malformed lease can never make sync guess a
+// root; the provider's own lease paths always carry it.
 function resolveSyncRemoteDir(lease: PluginEnvironmentLease): string {
   const remoteCwd = lease.metadata?.remoteCwd;
   if (typeof remoteCwd === "string" && remoteCwd.trim().length > 0) {
@@ -465,6 +471,7 @@ const plugin = definePlugin({
       secretName,
       phase: "Pending",
       backend: config.backend,
+      remoteCwd: DEFAULT_SYNC_REMOTE_DIR,
       // Recorded so release and destroy delete the Sandbox with the version
       // this lease was created with, even when discovery is unreachable then.
       sandboxApiVersion: sandboxVersion,
@@ -543,6 +550,14 @@ const plugin = definePlugin({
       secretName,
       phase: check.phase,
       backend: leaseBackend,
+      // Keep a recorded root from the original lease (it may be a custom
+      // workspace path); only leases created before this field existed need the
+      // canonical default so a resumed sync never trips the guard.
+      remoteCwd:
+        typeof params.leaseMetadata?.remoteCwd === "string" &&
+        params.leaseMetadata.remoteCwd.trim().length > 0
+          ? params.leaseMetadata.remoteCwd.trim()
+          : DEFAULT_SYNC_REMOTE_DIR,
       sandboxApiVersion: isSandboxApiVersion(params.leaseMetadata?.sandboxApiVersion)
         ? params.leaseMetadata.sandboxApiVersion
         : null,
@@ -576,7 +591,7 @@ const plugin = definePlugin({
     const cwd =
       params.workspace.remotePath && params.workspace.remotePath.trim().length > 0
         ? params.workspace.remotePath.trim()
-        : "/workspace";
+        : DEFAULT_SYNC_REMOTE_DIR;
     return {
       cwd,
       metadata: {

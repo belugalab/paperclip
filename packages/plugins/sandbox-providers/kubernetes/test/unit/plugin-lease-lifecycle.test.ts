@@ -95,11 +95,64 @@ describe("onEnvironmentResumeLease", () => {
         secretName: "pc-abc-env",
         phase: "Running",
         backend: "sandbox-cr",
+        // Older leases have no remoteCwd; resuming backfills the canonical root
+        // so the native-sync guard never fires on a resumed lease.
+        remoteCwd: "/workspace",
         resumedLease: true,
         // sandbox-cr has a pod-exec channel, so native file sync stays enabled.
         nativeFileSyncUnsupported: false,
       }),
     );
+  });
+
+  it("preserves an already recorded workspace remote dir when resuming", async () => {
+    h.clients = {
+      custom: {
+        getNamespacedCustomObject: vi.fn().mockResolvedValue(readySandboxCr("pc-abc-pod")),
+      },
+      core: {
+        readNamespacedPod: vi.fn().mockResolvedValue({
+          metadata: {},
+          status: { phase: "Running" },
+        }),
+      },
+    };
+
+    const lease = await plugin.definition.onEnvironmentResumeLease!({
+      driverKey: "kubernetes",
+      companyId: "acme",
+      environmentId: "env-1",
+      config: CONFIG,
+      providerLeaseId: "pc-abc",
+      leaseMetadata: leaseMetadata({ remoteCwd: "/custom/workspace" }),
+    });
+
+    expect(lease.metadata?.remoteCwd).toBe("/custom/workspace");
+  });
+
+  it("backfills the canonical workspace remote dir for a blank recorded value", async () => {
+    h.clients = {
+      custom: {
+        getNamespacedCustomObject: vi.fn().mockResolvedValue(readySandboxCr("pc-abc-pod")),
+      },
+      core: {
+        readNamespacedPod: vi.fn().mockResolvedValue({
+          metadata: {},
+          status: { phase: "Running" },
+        }),
+      },
+    };
+
+    const lease = await plugin.definition.onEnvironmentResumeLease!({
+      driverKey: "kubernetes",
+      companyId: "acme",
+      environmentId: "env-1",
+      config: CONFIG,
+      providerLeaseId: "pc-abc",
+      leaseMetadata: leaseMetadata({ remoteCwd: "   " }),
+    });
+
+    expect(lease.metadata?.remoteCwd).toBe("/workspace");
   });
 
   it("flags a resumed job-backend lease as native-sync-unsupported so the server keeps the base64 fallback", async () => {

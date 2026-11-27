@@ -91,6 +91,13 @@ export interface KubernetesLeaseMetadata {
   /** Which backend provisioned this lease. */
   backend: "sandbox-cr" | "job";
   /**
+   * Confinement root for native file sync, recorded when the lease is acquired
+   * or resumed and refreshed by realizeWorkspace. Absent on leases created by
+   * older plugin revisions; resolveSyncRemoteDir fails closed for those rather
+   * than guessing a root.
+   */
+  remoteCwd?: string;
+  /**
    * The Sandbox API version this lease was created with, for the sandbox-cr
    * backend. Release and destroy read it so cleanup deletes the resource with
    * the version that created it, and does not depend on API discovery being
